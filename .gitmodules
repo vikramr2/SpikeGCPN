@@ -1,0 +1,3 @@
+[submodule "superneuromat"]
+	path = superneuromat
+	url = https://github.com/ORNL/superneuromat.git
