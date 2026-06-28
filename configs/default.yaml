@@ -1,0 +1,47 @@
+# SpikeGCPN default hyperparameters
+# All paths are relative to the project root.
+
+env:
+  num_source: 2312        # 2 * 34 * 34  (N-MNIST pixel-polarity channels)
+  num_sink: 10            # one per digit class
+  max_hidden: 50          # hard cap on hidden neurons per episode
+  default_threshold: 0.5  # LIF threshold; must be < input spike value (1.0)
+  default_leak: .inf      # no membrane decay between timesteps
+
+model:
+  node_feat_dim: 5        # [threshold, leak, reset_state, refractory_period, node_type]
+  embed_dim: 64           # node embedding dimension (matches GCPN paper)
+  num_layers: 3           # GCN depth (matches GCPN paper)
+  num_edge_types: 2       # excitatory / inhibitory
+  mlp_hidden: 64          # hidden width for all four policy MLPs
+
+train:
+  lr: 1.0e-3              # Adam learning rate
+  gamma: 0.99             # discount factor
+  gae_lambda: 0.95        # GAE λ; set to 1.0 for 1-step TD (idea.md default)
+  clip_eps: 0.2           # PPO clip range ε (Eq. 5)
+  ppo_epochs: 4           # number of PPO update epochs per rollout
+  value_coeff: 0.5        # weight on value loss
+  entropy_coeff: 0.01     # weight on entropy bonus
+  max_grad_norm: 0.5      # gradient clipping norm
+
+  max_episodes: 10000
+  max_steps_per_episode: 100   # episode terminates if this is exceeded
+  log_interval: 10             # episodes between console log lines
+  eval_interval: 100           # episodes between full benchmark evaluations
+  checkpoint_interval: 500     # episodes between model saves
+  checkpoint_dir: experiments/checkpoints
+
+simulator:
+  nmnist_root: data/NMNIST
+  num_bins: 100               # temporal bins for spike encoding
+  train_eval_samples: 50      # quick per-episode accuracy estimate (5 per class)
+  full_eval_samples: 500      # accuracy for periodic benchmarking (50 per class)
+  eval_split: Test
+
+rewards:
+  validity_step: 0.001        # tiny reward per legal step (100 steps → +0.1 max)
+  invalid_step: -0.01         # mild penalty for rejected actions
+  efficiency_coeff: 0.0005    # penalty coefficient on (num_hidden + num_edges)
+  truncation_penalty: 0.5     # one-time penalty when episode hits max_steps without stopping;
+                               # ensures stopping early with ~10% acc beats never stopping

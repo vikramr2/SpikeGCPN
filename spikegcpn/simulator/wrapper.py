@@ -121,6 +121,7 @@ def evaluate(
     split: str = "Test",
     num_bins: int = 100,
     max_samples: int | None = None,
+    per_class: int | None = None,
 ) -> float:
     """
     Evaluate a topology graph on the N-MNIST test split.
@@ -138,7 +139,8 @@ def evaluate(
     num_sink      : number of sink/output nodes (default: 10)
     split         : "Test" or "Train"
     num_bins      : temporal resolution for spike encoding
-    max_samples   : cap evaluation at this many samples (None = all)
+    max_samples   : cap on total samples regardless of class balance
+    per_class     : if set, use at most this many samples per class (balanced)
 
     Returns
     -------
@@ -154,7 +156,7 @@ def evaluate(
     correct = 0
     total = 0
 
-    for sample in iter_dataset(nmnist_root, split=split, num_bins=num_bins, max_samples=max_samples):
+    for sample in iter_dataset(nmnist_root, split=split, num_bins=num_bins, max_samples=max_samples, per_class=per_class):
         # Reset all neuron states, spike history, and queued input spikes.
         snn.reset()
 

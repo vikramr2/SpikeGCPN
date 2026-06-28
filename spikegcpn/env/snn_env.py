@@ -123,6 +123,35 @@ class SNNEnv(gym.Env):
         self._graph = self._make_initial_graph()
         return self._obs(), {}
 
+    # ------------------------------------------------------------------
+    # Action masks
+    # ------------------------------------------------------------------
+
+    def valid_first_mask(self) -> "torch.Tensor":
+        """
+        Boolean mask over existing nodes for a_first (edge source).
+        Sink nodes must have out-degree 0, so they are excluded.
+        Valid: source nodes [0, num_source) and hidden nodes [num_source, sink_start).
+        """
+        n = self.num_nodes
+        mask = torch.ones(n, dtype=torch.bool)
+        mask[self.sink_start_idx:] = False  # exclude sink nodes
+        return mask
+
+    def valid_second_mask(self) -> "torch.Tensor":
+        """
+        Boolean mask over existing nodes for a_second (edge destination).
+        Source nodes must have in-degree 0, so they are excluded.
+        Valid: hidden [num_source, sink_start) and sink [sink_start, n).
+        The extra NEW_NODE option is always valid and is NOT covered by this mask.
+        """
+        n = self.num_nodes
+        mask = torch.ones(n, dtype=torch.bool)
+        mask[:self.num_source] = False  # exclude source nodes
+        return mask
+
+    # ------------------------------------------------------------------
+
     def step(self, action: dict):
         a_stop = bool(action["a_stop"])
 
@@ -141,6 +170,10 @@ class SNNEnv(gym.Env):
         if not (0 <= a_first < cur_nodes):
             return self._obs(), -0.1, False, False, {"invalid": "a_first out of range"}
 
+        # Enforce structural constraint: cannot draw an edge FROM a sink node
+        if a_first >= self.sink_start_idx:
+            return self._obs(), -0.1, False, False, {"invalid": "a_first is a sink node"}
+
         new_node_idx: int | None = None
 
         # --- Optionally add a new hidden neuron ---------------------------
@@ -154,16 +187,24 @@ class SNNEnv(gym.Env):
         if not (0 <= a_second < cur_nodes):
             return self._obs(), -0.1, False, False, {"invalid": "a_second out of range"}
 
+        # Enforce structural constraint: cannot draw an edge TO a source node
+        if a_second < self.num_source:
+            return self._obs(), -0.1, False, False, {"invalid": "a_second is a source node"}
+
+        # --- Reject duplicate edges ---------------------------------------
+        if self._edge_exists(a_first, a_second):
+            return self._obs(), -0.01, False, False, {"invalid": "duplicate edge"}
+
         # --- Check DAG constraint -----------------------------------------
         if would_create_cycle(self._graph.edge_index, cur_nodes, a_first, a_second):
-            return self._obs(), -0.1, False, False, {"invalid": "would create cycle"}
+            return self._obs(), -0.01, False, False, {"invalid": "would create cycle"}
 
         # --- Add edge -----------------------------------------------------
         weight = 1.0 if a_edge == 0 else -1.0
         self._add_edge(a_first, a_second, weight=weight, delay=1)
 
         # Small validity reward for each legal edge.
-        reward = 0.01
+        reward = 0.001
         info = {"graph": self._graph}
         if new_node_idx is not None:
             info["new_node_idx"] = new_node_idx
@@ -221,6 +262,13 @@ class SNNEnv(gym.Env):
         self._graph = Data(x=x, edge_index=ei, edge_attr=self._graph.edge_attr)
         self._num_hidden += 1
         return insert_at
+
+    def _edge_exists(self, src: int, dst: int) -> bool:
+        """Return True if edge src→dst is already present."""
+        ei = self._graph.edge_index
+        if ei.numel() == 0:
+            return False
+        return bool(((ei[0] == src) & (ei[1] == dst)).any().item())
 
     def _add_edge(self, src: int, dst: int, weight: float, delay: int) -> None:
         new_ei = torch.tensor([[src], [dst]], dtype=torch.long)
