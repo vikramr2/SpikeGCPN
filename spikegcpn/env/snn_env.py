@@ -1,105 +1,246 @@
 """
-Gymnasium environment for building SNN topologies as DAGs.
+Environment for building SNN topologies with *macro* actions.
 
-Structural invariants maintained at every step:
-  - Graph is always a DAG.
-  - Source nodes (indices [0, num_source)) are pre-instantiated at reset
-    and never removed.
-  - Sink nodes (indices [num_nodes-num_sink, num_nodes)) are pre-instantiated
-    at reset and never removed.
-  - Hidden nodes are inserted between source and sink blocks; sink indices
-    shift upward by 1 each time a hidden node is added.
+Two kinds of construction step (plus stop):
 
-Action dict keys
-----------------
-a_first  : int  — index of the edge's tail node
-a_second : int  — index of the edge's head node; pass NEW_NODE to add a
-                  new hidden neuron first (the new node's index is returned
-                  in info['new_node_idx'])
-a_edge   : int  — 0 = excitatory (weight +1), 1 = inhibitory (weight -1)
-a_stop   : bool — terminate the episode
+  NEW      create a hidden neuron with a receptive field: all input sources in a
+           (2r+1)×(2r+1) window of patch cells centred on `a_cell`, for one or
+           both polarities, connected to the new neuron with one shared weight.
+           The neuron's (threshold, leak) comes from a preset.
+  CONNECT  add one synapse a_first → a_second between existing neurons
+           (tail: hidden; head: hidden or sink). Recurrent loops are legal when
+           allow_cycles=True, otherwise the graph stays a DAG.
 
-Observation
------------
-The current PyG Data object (data.x, data.edge_index, data.edge_attr).
-A gym spaces.Graph space is declared for compatibility, but agents
-typically consume the Data object directly.
+A topology therefore takes ~20–60 decisions instead of one per synapse.
 
-Node features  [threshold, leak, reset_state, refractory_period, node_type]
-Edge features  [weight, delay]
+Node index layout (fixed, never shifts):
+    [0, S)          source neurons, S = 2·G·G (polarity-major over a G×G patch grid)
+    [S, S+K)        sink neurons, one per class (pre-instantiated)
+    [S+K, S+K+H)    hidden neurons, appended in creation order
 
-Node types: SOURCE=0, HIDDEN=1, SINK=2
+Nodes and edges are only appended, so the state after t actions is a prefix of
+the final graph: x[:S+K+h_t], edge_index[:, :e_t], edge_attr[:e_t]; trajectories
+store h_t and e_t per step (`prefix_graph`).
+
+Action dict (unused fields are -1)
+----------------------------------
+a_stop   : 0/1
+a_kind   : 0 = NEW, 1 = CONNECT
+a_cell   : NEW — receptive-field centre, gy·G + gx
+a_radius : NEW — index into spec.rf_radii
+a_pol    : NEW — 0 = OFF only, 1 = ON only, 2 = both polarities
+a_node   : NEW — hidden preset index (threshold, leak)
+a_first  : CONNECT — tail (hidden node index)
+a_second : CONNECT — head (hidden or sink node index)
+a_edge   : weight bin in [0, 2L) for the new synapse(s): [0, L) excitatory with
+           magnitude weight_levels[b], [L, 2L) inhibitory
+
+Actions must respect the masks (`masks()`, `rf_edge_table`, `second_mask`); an
+illegal action raises.
+
+Node features (9 columns)
+-------------------------
+0 threshold   1 leak   2 reset_state   3 refractory_period   4 node_type
+5 pos_x       6 pos_y  7 polarity      8 sink_id (class index, -1 otherwise)
+
+Edge features: [weight, delay]
 """
 
 from __future__ import annotations
 
-import numpy as np
+import math
+from dataclasses import dataclass, field
+
 import torch
-import gymnasium as gym
-from gymnasium import spaces
 from torch_geometric.data import Data
 
-from spikegcpn.env.validity import would_create_cycle, all_sinks_reachable
-from spikegcpn.data.nmnist import NUM_SOURCE_NODES, NUM_CLASSES
+from spikegcpn.data.nmnist import NUM_CLASSES, num_source_nodes, source_positions
+from spikegcpn.env.validity import connect_first_mask, second_mask
 
-# Sentinel value for a_second meaning "add a new hidden node".
-NEW_NODE: int = -1
+NEW, CONNECT = 0, 1
 
-# Node-type constants (stored in node feature column 4).
 SOURCE: int = 0
-HIDDEN: int = 1
-SINK: int = 2
+SINK: int = 1
+HIDDEN: int = 2
 
-_NODE_FEATURES = 5   # threshold, leak, reset_state, refractory_period, node_type
-_EDGE_FEATURES = 2   # weight, delay
+THR, LEAK, RESET, REFRAC, TYPE, PX, PY, POL, SINK_ID = range(9)
+NODE_FEATURES = 9
+EDGE_FEATURES = 2
+NUM_POL_CHOICES = 3   # OFF, ON, both
 
 
-class SNNEnv(gym.Env):
-    """
-    Parameters
-    ----------
-    num_source        : number of input (source) neurons; defaults to N-MNIST
-    num_sink          : number of output (sink) neurons; defaults to 10 classes
-    max_hidden        : hard cap on hidden neurons per episode
-    default_threshold : LIF threshold applied to all neurons at reset
-    default_leak      : LIF leak applied to all neurons at reset
-    """
+@dataclass
+class GraphSpec:
+    """Everything that defines the search space. Shared by env, policy and rewards."""
+    num_source: int | None = None    # default: num_source_nodes(patch_size); must be 2·G·G
+    num_sink: int = NUM_CLASSES
+    patch_size: int = 1              # N-MNIST pixels pooled per source (1 = raw pixels)
+    max_hidden: int = 50
+    max_edges: int = 100
+    min_edges: int = 0               # stop is masked until this many edges exist (= max_edges: fixed size)
+    allow_cycles: bool = False       # recurrent connections between hidden neurons (reservoirs)
+    rf_radii: list[int] = field(default_factory=lambda: [0, 1, 2])
+    # Synapse magnitudes, each offered as +w and -w. With BPTT inner training use
+    # a single level: the policy then only picks the sign and gradients set |w|.
+    weight_levels: list[float] = field(default_factory=lambda: [0.25, 0.5, 1.0, 2.0])
+    # (threshold, leak) presets for hidden neurons. SuperNeuroMAT leak = linear
+    # decay toward reset per step: 0 = perfect integrator, inf = memoryless.
+    hidden_presets: list[tuple[float, float]] = field(default_factory=lambda: [
+        (0.5, float("inf")),
+        (1.0, 0.0),
+        (1.0, 0.25),
+        (2.0, 0.5),
+        (3.0, 0.1),
+    ])
+    source_threshold: float = 0.5
+    source_leak: float = float("inf")
+    sink_threshold: float = 1.0
+    sink_leak: float = 0.0
 
-    metadata = {"render_modes": []}
+    def __post_init__(self) -> None:
+        if self.num_source is None:
+            self.num_source = num_source_nodes(self.patch_size)
+        g = math.isqrt(self.num_source // 2)
+        if 2 * g * g != self.num_source:
+            raise ValueError(f"num_source={self.num_source} must be 2·G·G (polarity × square patch grid)")
+        self.grid = g
+        self._rf_table: torch.Tensor | None = None
 
-    def __init__(
-        self,
-        num_source: int = NUM_SOURCE_NODES,
-        num_sink: int = NUM_CLASSES,
-        max_hidden: int = 200,
-        default_threshold: float = 0.5,
-        default_leak: float = float("inf"),
-    ) -> None:
-        super().__init__()
-        self.num_source = num_source
-        self.num_sink = num_sink
-        self.max_hidden = max_hidden
-        self.default_threshold = default_threshold
-        self.default_leak = default_leak
+    @property
+    def num_cells(self) -> int:
+        return self.grid * self.grid
 
-        max_nodes = num_source + max_hidden + num_sink
-        self.observation_space = spaces.Graph(
-            node_space=spaces.Box(low=-np.inf, high=np.inf, shape=(_NODE_FEATURES,)),
-            edge_space=spaces.Box(low=-np.inf, high=np.inf, shape=(_EDGE_FEATURES,)),
-        )
-        self.action_space = spaces.Dict({
-            "a_first":  spaces.Discrete(max_nodes),
-            "a_second": spaces.Discrete(max_nodes + 1, start=-1),  # -1 = NEW_NODE
-            "a_edge":   spaces.Discrete(2),   # 0=excitatory, 1=inhibitory
-            "a_stop":   spaces.Discrete(2),   # 0=continue,   1=stop
-        })
+    @property
+    def num_edge_actions(self) -> int:
+        return 2 * len(self.weight_levels)
 
+    @property
+    def num_presets(self) -> int:
+        return len(self.hidden_presets)
+
+    @property
+    def hidden_start(self) -> int:
+        return self.num_source + self.num_sink
+
+    def weight_of(self, a_edge: int) -> float:
+        L = len(self.weight_levels)
+        sign = 1.0 if a_edge < L else -1.0
+        return sign * float(self.weight_levels[a_edge % L])
+
+    def rf_sources(self, cell: int, radius_idx: int, pol: int) -> list[int]:
+        """Sorted source indices of the receptive field."""
+        G, r = self.grid, self.rf_radii[radius_idx]
+        cy, cx = divmod(cell, G)
+        cells = [y * G + x for y in range(max(0, cy - r), min(G, cy + r + 1))
+                 for x in range(max(0, cx - r), min(G, cx + r + 1))]
+        pols = [pol] if pol < 2 else [0, 1]
+        return sorted(p * G * G + c for p in pols for c in cells)
+
+    def rf_edge_table(self) -> torch.Tensor:
+        """[cells, radii, 3] number of synapses each NEW choice would add."""
+        if self._rf_table is None:
+            t = torch.zeros(self.num_cells, len(self.rf_radii), NUM_POL_CHOICES, dtype=torch.long)
+            for c in range(self.num_cells):
+                for r in range(len(self.rf_radii)):
+                    for p in range(NUM_POL_CHOICES):
+                        t[c, r, p] = len(self.rf_sources(c, r, p))
+            self._rf_table = t
+        return self._rf_table
+
+    def rf_multiplicity(self, sources: tuple[int, ...]) -> int:
+        """How many (cell, radius, pol) choices produce exactly this receptive field."""
+        if not hasattr(self, "_rf_mult"):
+            from collections import Counter
+            self._rf_mult = Counter(
+                tuple(self.rf_sources(c, r, p))
+                for c in range(self.num_cells) for r in range(len(self.rf_radii)) for p in range(NUM_POL_CHOICES)
+            )
+        return self._rf_mult[tuple(sources)]
+
+    @classmethod
+    def from_config(cls, env_cfg: dict) -> "GraphSpec":
+        kw = {k: v for k, v in env_cfg.items() if k in cls.__dataclass_fields__}
+        if "hidden_presets" in kw:
+            kw["hidden_presets"] = [
+                (float(p["threshold"]), float(p["leak"])) if isinstance(p, dict) else tuple(map(float, p))
+                for p in kw["hidden_presets"]
+            ]
+        return cls(**kw)
+
+
+@dataclass
+class Masks:
+    stop_allowed: bool
+    continue_allowed: bool
+    new_allowed: bool
+    connect_allowed: bool
+    remaining: int               # edge budget left
+    first: torch.Tensor          # bool [n]: legal CONNECT tails
+
+
+def masks(graph: Data, spec: GraphSpec, num_hidden: int) -> Masks:
+    E = int(graph.edge_index.shape[1])
+    remaining = spec.max_edges - E
+    new_ok = num_hidden < spec.max_hidden and remaining >= 1
+    first = connect_first_mask(graph.edge_index, spec.num_source, spec.num_sink, num_hidden, spec.allow_cycles)
+    conn_ok = remaining >= 1 and bool(first.any())
+    cont = new_ok or conn_ok
+    return Masks(
+        stop_allowed=(not cont) or E >= spec.min_edges,
+        continue_allowed=cont,
+        new_allowed=new_ok,
+        connect_allowed=conn_ok,
+        remaining=remaining,
+        first=first,
+    )
+
+
+def second_mask_for(graph: Data, spec: GraphSpec, num_hidden: int, a_first: int) -> torch.Tensor:
+    return second_mask(graph.edge_index, spec.num_source, spec.num_sink, num_hidden, a_first, spec.allow_cycles)
+
+
+def initial_graph(spec: GraphSpec) -> Data:
+    S, K = spec.num_source, spec.num_sink
+    x = torch.zeros(S + K, NODE_FEATURES)
+    x[:, SINK_ID] = -1.0
+
+    x[:S, THR] = spec.source_threshold
+    x[:S, LEAK] = spec.source_leak
+    x[:S, TYPE] = SOURCE
+    x[:S, PX:POL + 1] = torch.from_numpy(source_positions(S, spec.patch_size))
+
+    x[S:, THR] = spec.sink_threshold
+    x[S:, LEAK] = spec.sink_leak
+    x[S:, TYPE] = SINK
+    x[S:, SINK_ID] = torch.arange(K, dtype=torch.float32)
+
+    return Data(
+        x=x,
+        edge_index=torch.zeros(2, 0, dtype=torch.long),
+        edge_attr=torch.zeros(0, EDGE_FEATURES),
+    )
+
+
+def prefix_graph(final: Data, num_edges: int, num_hidden: int, spec: GraphSpec) -> Data:
+    """State with `num_hidden` hidden neurons and the first `num_edges` edges of `final`."""
+    return Data(
+        x=final.x[: spec.hidden_start + num_hidden],
+        edge_index=final.edge_index[:, :num_edges],
+        edge_attr=final.edge_attr[:num_edges],
+    )
+
+
+STOP_ACTION = {"a_stop": 1, "a_kind": -1, "a_cell": -1, "a_radius": -1, "a_pol": -1,
+               "a_node": -1, "a_first": -1, "a_second": -1, "a_edge": -1}
+
+
+class SNNEnv:
+    """Minimal stateful wrapper around the pure helpers above."""
+
+    def __init__(self, spec: GraphSpec) -> None:
+        self.spec = spec
         self._graph: Data | None = None
-        self._num_hidden: int = 0
-
-    # ------------------------------------------------------------------
-    # Public properties
-    # ------------------------------------------------------------------
+        self.num_hidden = 0
 
     @property
     def graph(self) -> Data:
@@ -107,174 +248,71 @@ class SNNEnv(gym.Env):
 
     @property
     def num_nodes(self) -> int:
-        return self.num_source + self._num_hidden + self.num_sink
+        return self.spec.hidden_start + self.num_hidden
 
     @property
-    def sink_start_idx(self) -> int:
-        return self.num_source + self._num_hidden
+    def num_edges(self) -> int:
+        return int(self._graph.edge_index.shape[1])
 
-    # ------------------------------------------------------------------
-    # Gymnasium interface
-    # ------------------------------------------------------------------
-
-    def reset(self, seed: int | None = None, options: dict | None = None):
-        super().reset(seed=seed)
-        self._num_hidden = 0
-        self._graph = self._make_initial_graph()
-        return self._obs(), {}
-
-    # ------------------------------------------------------------------
-    # Action masks
-    # ------------------------------------------------------------------
-
-    def valid_first_mask(self) -> "torch.Tensor":
-        """
-        Boolean mask over existing nodes for a_first (edge source).
-        Sink nodes must have out-degree 0, so they are excluded.
-        Valid: source nodes [0, num_source) and hidden nodes [num_source, sink_start).
-        """
-        n = self.num_nodes
-        mask = torch.ones(n, dtype=torch.bool)
-        mask[self.sink_start_idx:] = False  # exclude sink nodes
-        return mask
-
-    def valid_second_mask(self) -> "torch.Tensor":
-        """
-        Boolean mask over existing nodes for a_second (edge destination).
-        Source nodes must have in-degree 0, so they are excluded.
-        Valid: hidden [num_source, sink_start) and sink [sink_start, n).
-        The extra NEW_NODE option is always valid and is NOT covered by this mask.
-        """
-        n = self.num_nodes
-        mask = torch.ones(n, dtype=torch.bool)
-        mask[:self.num_source] = False  # exclude source nodes
-        return mask
-
-    # ------------------------------------------------------------------
-
-    def step(self, action: dict):
-        a_stop = bool(action["a_stop"])
-
-        if a_stop:
-            terminated = True
-            reward = 0.0
-            info: dict = {"graph": self._graph}
-            return self._obs(), reward, terminated, False, info
-
-        a_first = int(action["a_first"])
-        a_second = int(action["a_second"])
-        a_edge = int(action["a_edge"])
-
-        # --- Validate node indices ----------------------------------------
-        cur_nodes = self.num_nodes
-        if not (0 <= a_first < cur_nodes):
-            return self._obs(), -0.1, False, False, {"invalid": "a_first out of range"}
-
-        # Enforce structural constraint: cannot draw an edge FROM a sink node
-        if a_first >= self.sink_start_idx:
-            return self._obs(), -0.1, False, False, {"invalid": "a_first is a sink node"}
-
-        new_node_idx: int | None = None
-
-        # --- Optionally add a new hidden neuron ---------------------------
-        if a_second == NEW_NODE:
-            if self._num_hidden >= self.max_hidden:
-                return self._obs(), -0.1, False, False, {"invalid": "max_hidden reached"}
-            new_node_idx = self._add_hidden_node()
-            a_second = new_node_idx
-            cur_nodes = self.num_nodes  # updated after insertion
-
-        if not (0 <= a_second < cur_nodes):
-            return self._obs(), -0.1, False, False, {"invalid": "a_second out of range"}
-
-        # Enforce structural constraint: cannot draw an edge TO a source node
-        if a_second < self.num_source:
-            return self._obs(), -0.1, False, False, {"invalid": "a_second is a source node"}
-
-        # --- Reject duplicate edges ---------------------------------------
-        if self._edge_exists(a_first, a_second):
-            return self._obs(), -0.01, False, False, {"invalid": "duplicate edge"}
-
-        # --- Check DAG constraint -----------------------------------------
-        if would_create_cycle(self._graph.edge_index, cur_nodes, a_first, a_second):
-            return self._obs(), -0.01, False, False, {"invalid": "would create cycle"}
-
-        # --- Add edge -----------------------------------------------------
-        weight = 1.0 if a_edge == 0 else -1.0
-        self._add_edge(a_first, a_second, weight=weight, delay=1)
-
-        # Small validity reward for each legal edge.
-        reward = 0.001
-        info = {"graph": self._graph}
-        if new_node_idx is not None:
-            info["new_node_idx"] = new_node_idx
-
-        return self._obs(), reward, False, False, info
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _obs(self):
+    def reset(self) -> Data:
+        self.num_hidden = 0
+        self._graph = initial_graph(self.spec)
         return self._graph
 
-    def _make_initial_graph(self) -> Data:
-        """Pre-instantiate source and sink nodes with empty edge sets."""
-        n = self.num_source + self.num_sink
-        x = torch.zeros(n, _NODE_FEATURES)
+    def masks(self) -> Masks:
+        return masks(self._graph, self.spec, self.num_hidden)
 
-        # Source nodes
-        x[: self.num_source, 0] = self.default_threshold
-        x[: self.num_source, 1] = self.default_leak
-        x[: self.num_source, 4] = SOURCE
+    def second_mask(self, a_first: int) -> torch.Tensor:
+        return second_mask_for(self._graph, self.spec, self.num_hidden, a_first)
 
-        # Sink nodes
-        x[self.num_source :, 0] = self.default_threshold
-        x[self.num_source :, 1] = self.default_leak
-        x[self.num_source :, 4] = SINK
+    def step(self, action: dict) -> tuple[Data, bool]:
+        """Apply a legal action. Returns (graph, done)."""
+        m = self.masks()
+        if action["a_stop"]:
+            if not m.stop_allowed:
+                raise ValueError(f"stop not allowed before min_edges={self.spec.min_edges}")
+            return self._graph, True
+        if not m.continue_allowed:
+            raise ValueError("episode must stop")
 
-        return Data(
-            x=x,
-            edge_index=torch.zeros(2, 0, dtype=torch.long),
-            edge_attr=torch.zeros(0, _EDGE_FEATURES),
+        spec = self.spec
+        w = spec.weight_of(int(action["a_edge"]))
+        if action["a_kind"] == NEW:
+            if not m.new_allowed:
+                raise ValueError("NEW not allowed")
+            srcs = spec.rf_sources(int(action["a_cell"]), int(action["a_radius"]), int(action["a_pol"]))
+            if len(srcs) > m.remaining:
+                raise ValueError("receptive field exceeds the edge budget")
+            v = self._add_hidden_node(*spec.hidden_presets[int(action["a_node"])])
+            self._add_edges(srcs, [v] * len(srcs), w)
+        elif action["a_kind"] == CONNECT:
+            u, v = int(action["a_first"]), int(action["a_second"])
+            if not m.connect_allowed or not bool(m.first[u]) or not bool(self.second_mask(u)[v]):
+                raise ValueError(f"illegal synapse {u}->{v}")
+            self._add_edges([u], [v], w)
+        else:
+            raise ValueError(f"unknown a_kind {action['a_kind']}")
+        return self._graph, False
+
+    def _add_hidden_node(self, threshold: float, leak: float) -> int:
+        feat = torch.zeros(1, NODE_FEATURES)
+        feat[0, THR] = threshold
+        feat[0, LEAK] = leak
+        feat[0, TYPE] = HIDDEN
+        feat[0, SINK_ID] = -1.0
+        idx = self.num_nodes
+        self._graph = Data(
+            x=torch.cat([self._graph.x, feat], dim=0),
+            edge_index=self._graph.edge_index,
+            edge_attr=self._graph.edge_attr,
         )
+        self.num_hidden += 1
+        return idx
 
-    def _add_hidden_node(self) -> int:
-        """
-        Insert a hidden node at position sink_start_idx, shifting all sink
-        indices in edge_index up by 1. Returns the new node's index.
-        """
-        insert_at = self.sink_start_idx  # before current sinks
-
-        new_feat = torch.zeros(1, _NODE_FEATURES)
-        new_feat[0, 0] = self.default_threshold
-        new_feat[0, 1] = self.default_leak
-        new_feat[0, 4] = HIDDEN
-
-        x = torch.cat(
-            [self._graph.x[:insert_at], new_feat, self._graph.x[insert_at:]], dim=0
-        )
-
-        # Shift any existing edge endpoints that pointed at sink nodes.
-        ei = self._graph.edge_index.clone()
-        ei[ei >= insert_at] += 1
-
-        self._graph = Data(x=x, edge_index=ei, edge_attr=self._graph.edge_attr)
-        self._num_hidden += 1
-        return insert_at
-
-    def _edge_exists(self, src: int, dst: int) -> bool:
-        """Return True if edge src→dst is already present."""
-        ei = self._graph.edge_index
-        if ei.numel() == 0:
-            return False
-        return bool(((ei[0] == src) & (ei[1] == dst)).any().item())
-
-    def _add_edge(self, src: int, dst: int, weight: float, delay: int) -> None:
-        new_ei = torch.tensor([[src], [dst]], dtype=torch.long)
-        new_ea = torch.tensor([[weight, float(delay)]])
+    def _add_edges(self, src: list[int], dst: list[int], weight: float, delay: int = 1) -> None:
+        k = len(src)
         self._graph = Data(
             x=self._graph.x,
-            edge_index=torch.cat([self._graph.edge_index, new_ei], dim=1),
-            edge_attr=torch.cat([self._graph.edge_attr, new_ea], dim=0),
+            edge_index=torch.cat([self._graph.edge_index, torch.tensor([src, dst], dtype=torch.long)], dim=1),
+            edge_attr=torch.cat([self._graph.edge_attr, torch.tensor([[weight, float(delay)]] * k)], dim=0),
         )

@@ -1,270 +1,223 @@
 """
-GCPN policy head (You et al., NeurIPS 2018, Section 3.4 / Eq. 3-4).
+Batched autoregressive policy over macro actions (see env/snn_env.py).
 
-Action at time t is a tuple (a_first, a_second, a_edge, a_stop):
+For a batch of B graph states encoded together (one GraphEncoder call on their
+disjoint union), every decision stage is evaluated for all rows at once:
 
-  f_first(s_t)  = SOFTMAX( m_f(H) )
-      → distribution over n existing nodes
+  a_stop  ~ m_stop(c)                                   {continue, stop}
+  a_kind  ~ m_kind(c)                                   {NEW, CONNECT}
+  NEW:      a_cell   ~ m_cell([z_cell ‖ c])             per patch cell; z_cell = mean of
+                                                        that cell's two source embeddings
+            a_radius ~ m_radius([z_cell ‖ c])           radii whose field fits the budget
+            a_pol    ~ m_pol([z_cell ‖ c ‖ onehot(r)])  polarities that fit the budget
+            a_node   ~ m_node([z_cell ‖ c])             hidden preset
+            a_edge   ~ m_wnew([z_cell ‖ c])             shared weight bin of the field
+  CONNECT:  a_first  ~ m_first([z_i ‖ c])               legal hidden tails
+            a_second ~ m_second([z_first ‖ z_j ‖ c])    legal heads
+            a_edge   ~ m_wconn([z_first ‖ z_second ‖ c])
 
-  f_second(s_t) = SOFTMAX( m_s([ H[a_first] ‖ H_cand ]) )
-      → distribution over n existing nodes + 1 "new hidden neuron" option
-
-  f_edge(s_t)   = SOFTMAX( m_e([ H[a_first] ‖ H[a_second] ]) )
-      → distribution over 2 edge types (excitatory / inhibitory)
-
-  f_stop(s_t)   = SOFTMAX( m_t(AGG(H)) )
-      → distribution over {continue, stop}
-
-SNN adaptation:
-- No scaffold set C; instead a single learnable "new_node_emb" parameter
-  represents the prototype embedding of an uninstantiated hidden neuron.
-- When a_second == n (the (n+1)-th option), the environment creates a new
-  hidden neuron. The env-facing sentinel is NEW_NODE = -1.
+c = [mean(H), mean(H_non-source), E/max_edges, H/max_hidden] per graph.
+Masks are exact, so log π(a|s) is the log-probability of the real transition
+(used directly by trajectory balance). Rows where a stage is not reached
+contribute log 1 = 0 and no entropy.
 """
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Callable
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
+from torch.distributions import Categorical
+from torch_geometric.data import Data
 
-EMBED_DIM = 64
-MLP_HIDDEN = 64
-NUM_EDGE_TYPES = 2
-NEW_NODE = -1  # sentinel used by the environment
-
-
-class LogProbs(NamedTuple):
-    first: Tensor
-    second: Tensor
-    edge: Tensor
-    stop: Tensor
-
-    def total(self) -> Tensor:
-        """Joint log-prob under the factored policy."""
-        return self.first + self.second + self.edge + self.stop
+from spikegcpn.env.snn_env import CONNECT, NEW, NUM_POL_CHOICES, SOURCE, STOP_ACTION, TYPE, GraphSpec, Masks
 
 
 def _mlp(in_dim: int, hidden: int, out_dim: int) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(in_dim, hidden),
-        nn.ReLU(),
-        nn.Linear(hidden, out_dim),
-    )
+    return nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, out_dim))
+
+
+def _categorical(logits: Tensor, mask: Tensor, temperature: float, eps: float) -> Categorical:
+    if temperature != 1.0:
+        logits = logits / temperature
+    logits = logits.masked_fill(~mask, float("-inf"))
+    if eps > 0.0:
+        valid = mask.float()
+        probs = (1 - eps) * torch.softmax(logits, dim=-1) + eps * valid / valid.sum(-1, keepdim=True)
+        return Categorical(probs=probs)
+    return Categorical(logits=logits)
+
+
+def collate(graphs: list[Data]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Disjoint union: (x, edge_index, edge_attr, ptr) with ptr[i] = first node of graph i."""
+    sizes = torch.tensor([g.num_nodes for g in graphs])
+    ptr = torch.zeros(len(graphs) + 1, dtype=torch.long)
+    ptr[1:] = sizes.cumsum(0)
+    x = torch.cat([g.x for g in graphs])
+    ei = torch.cat([g.edge_index + ptr[i] for i, g in enumerate(graphs)], dim=1)
+    ea = torch.cat([g.edge_attr for g in graphs])
+    return x, ei, ea, ptr
 
 
 class PolicyHead(nn.Module):
-    """
-    Four-headed policy following GCPN Eq. 4.
-
-    Parameters
-    ----------
-    embed_dim : node embedding dimension (must match GCNEncoder output)
-    mlp_hidden : hidden layer width for all four MLPs
-    """
-
-    def __init__(self, embed_dim: int = EMBED_DIM, mlp_hidden: int = MLP_HIDDEN):
+    def __init__(self, spec: GraphSpec, embed_dim: int = 64, mlp_hidden: int = 128):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.spec = spec
+        d, c, R, L2 = embed_dim, 2 * embed_dim + 2, len(spec.rf_radii), spec.num_edge_actions
+        self.m_stop = _mlp(c, mlp_hidden, 2)
+        self.m_kind = _mlp(c, mlp_hidden, 2)
+        self.m_cell = _mlp(d + c, mlp_hidden, 1)
+        self.m_radius = _mlp(d + c, mlp_hidden, R)
+        self.m_pol = _mlp(d + c + R, mlp_hidden, NUM_POL_CHOICES)
+        self.m_node = _mlp(d + c, mlp_hidden, spec.num_presets)
+        self.m_wnew = _mlp(d + c, mlp_hidden, L2)
+        self.m_first = _mlp(d + c, mlp_hidden, 1)
+        self.m_second = _mlp(2 * d + c, mlp_hidden, 1)
+        self.m_wconn = _mlp(2 * d + c, mlp_hidden, L2)
 
-        # m_f : z_i          → scalar score per node
-        self.m_f = _mlp(embed_dim, mlp_hidden, 1)
+        # Start with a small P(stop) where stopping is allowed, so early episodes
+        # are not cut short at P(stop) = 0.5.
+        with torch.no_grad():
+            self.m_stop[-1].bias.copy_(torch.tensor([0.0, float(torch.logit(torch.tensor(0.03)))]))
+            self.m_stop[-1].weight.mul_(0.1)
 
-        # m_s : [z_first ‖ z_j] → scalar score per candidate j (existing or new)
-        self.m_s = _mlp(2 * embed_dim, mlp_hidden, 1)
-
-        # m_e : [z_first ‖ z_second] → score per edge type
-        self.m_e = _mlp(2 * embed_dim, mlp_hidden, NUM_EDGE_TYPES)
-
-        # m_t : graph_embedding → score per {continue, stop}
-        self.m_t = _mlp(embed_dim, mlp_hidden, 2)
-
-        # Prototype embedding for an uninstantiated new hidden neuron
-        self.new_node_emb = nn.Parameter(torch.randn(embed_dim) * 0.1)
-
-    # ------------------------------------------------------------------
-    # Core distributions
-    # ------------------------------------------------------------------
-
-    def first_dist(
+    def forward_batch(
         self,
         H: Tensor,
-        mask: Tensor | None = None,
-    ) -> torch.distributions.Categorical:
+        ptr: Tensor,
+        graphs: list[Data],
+        hidden_counts: list[int],
+        masks: list[Masks],
+        actions: list[dict] | None = None,
+        second_masks: list[Tensor | None] | None = None,
+        second_mask_fn: Callable[[int, int], Tensor] | None = None,
+        temperature: float = 1.0,
+        eps: float = 0.0,
+    ) -> tuple[list[dict], Tensor, Tensor, list[Tensor | None]]:
         """
-        Distribution over existing n nodes.
-
-        Parameters
-        ----------
-        mask : optional bool tensor [n]; True = node is a valid a_first choice.
-               Source nodes are always valid; sink nodes are masked out.
+        Sample (actions=None, needs second_mask_fn(row, a_first)) or score given
+        actions (needs the stored second_masks). Returns (actions, log_prob [B],
+        entropy [B], second masks used per row).
         """
-        logits = self.m_f(H).squeeze(-1)           # [n]
-        if mask is not None:
-            logits = logits.masked_fill(~mask, float("-inf"))
-        return torch.distributions.Categorical(logits=logits)
+        spec = self.spec
+        sample = actions is None
+        B = len(graphs)
+        N = H.size(0)
+        S, G2 = spec.num_source, spec.num_cells
+        sizes = ptr[1:] - ptr[:-1]
+        gid = torch.repeat_interleave(torch.arange(B), sizes)
+        local = torch.arange(N) - ptr[gid]
+        rows = torch.arange(B)
 
-    def second_dist(
-        self,
-        H: Tensor,
-        a_first: int | Tensor,
-        mask: Tensor | None = None,
-    ) -> torch.distributions.Categorical:
-        """
-        Distribution over n existing nodes + 1 new-hidden option.
-        Candidates: H (rows) + new_node_emb (appended as row n).
+        # --- graph context ------------------------------------------------
+        mean_all = torch.zeros(B, H.size(1)).index_add(0, gid, H) / sizes.unsqueeze(1)
+        ns = torch.cat([g.x[:, TYPE] != SOURCE for g in graphs])
+        ns_cnt = torch.zeros(B).index_add(0, gid, ns.float()).clamp(min=1)
+        mean_ns = torch.zeros(B, H.size(1)).index_add(0, gid[ns], H[ns]) / ns_cnt.unsqueeze(1)
+        E = torch.tensor([float(g.edge_index.shape[1]) for g in graphs])
+        Hc = torch.tensor([float(h) for h in hidden_counts])
+        c = torch.cat([mean_all, mean_ns, (E / spec.max_edges).unsqueeze(1),
+                       (Hc / max(1, spec.max_hidden)).unsqueeze(1)], dim=1)
 
-        Parameters
-        ----------
-        mask : optional bool tensor [n]; True = node is a valid a_second choice.
-               Source nodes are masked out; the new-hidden option (index n)
-               is always kept valid.
-        """
-        n = H.size(0)
-        z_first = H[int(a_first)]                  # [d]
+        logp = torch.zeros(B)
+        ent = torch.zeros(B)
+        chosen: dict[str, Tensor] = {}
 
-        cand = torch.cat([H, self.new_node_emb.unsqueeze(0)], dim=0)   # [n+1, d]
-        z_first_rep = z_first.unsqueeze(0).expand(n + 1, -1)            # [n+1, d]
-        pair = torch.cat([z_first_rep, cand], dim=1)                    # [n+1, 2d]
-        logits = self.m_s(pair).squeeze(-1)                             # [n+1]
+        def stored(key: str, active: Tensor) -> Tensor:
+            v = torch.tensor([a[key] for a in actions])
+            return torch.where(active, v, torch.zeros_like(v))
 
-        if mask is not None:
-            # mask covers existing n nodes; append True for the new-hidden option
-            full_mask = torch.cat([mask, mask.new_ones(1)], dim=0)     # [n+1]
-            logits = logits.masked_fill(~full_mask, float("-inf"))
+        def pick(key: str, logits: Tensor, mask: Tensor, active: Tensor) -> Tensor:
+            nonlocal logp, ent
+            mask = torch.where(active.unsqueeze(1), mask, mask | dummy_ok(mask))
+            dist = _categorical(logits, mask, temperature, eps)
+            val = dist.sample() if sample else stored(key, active)
+            logp = logp + torch.where(active, dist.log_prob(val), torch.zeros(()))
+            ent = ent + torch.where(active, dist.entropy(), torch.zeros(()))
+            chosen[key] = torch.where(active, val, torch.full_like(val, -1))
+            return val
 
-        return torch.distributions.Categorical(logits=logits)
+        def dummy_ok(mask: Tensor) -> Tensor:
+            # Inactive rows get any finite-logit option so their (ignored) dists are valid.
+            ok = torch.zeros_like(mask)
+            ok[:, 0] = True
+            return ok
 
-    def edge_dist(
-        self, H: Tensor, a_first: int | Tensor, a_second_raw: int | Tensor
-    ) -> torch.distributions.Categorical:
-        """
-        Distribution over edge types.
-        a_second_raw is in [0..n] where n = new-node option.
-        """
-        n = H.size(0)
-        a_second_raw = int(a_second_raw)
-        z_first = H[int(a_first)]
-        z_second = H[a_second_raw] if a_second_raw < n else self.new_node_emb
-        pair = torch.cat([z_first, z_second], dim=0).unsqueeze(0)  # [1, 2d]
-        logits = self.m_e(pair).squeeze(0)                          # [2]
-        return torch.distributions.Categorical(logits=logits)
+        all_rows = torch.ones(B, dtype=torch.bool)
 
-    def stop_dist(self, H: Tensor) -> torch.distributions.Categorical:
-        """Distribution over {continue=0, stop=1}."""
-        graph_emb = H.sum(dim=0)               # [d]  SUM pooling
-        logits = self.m_t(graph_emb)           # [2]
-        return torch.distributions.Categorical(logits=logits)
+        # --- stop / kind ----------------------------------------------------
+        stop_mask = torch.tensor([[m.continue_allowed, m.stop_allowed] for m in masks])
+        a_stop = pick("a_stop", self.m_stop(c), stop_mask, all_rows)
+        is_cont = a_stop == 0
+        kind_mask = torch.tensor([[m.new_allowed, m.connect_allowed] for m in masks])
+        a_kind = pick("a_kind", self.m_kind(c), kind_mask, is_cont)
+        is_new = is_cont & (a_kind == NEW)
+        is_conn = is_cont & (a_kind == CONNECT)
 
-    # ------------------------------------------------------------------
-    # Sample a complete action
-    # ------------------------------------------------------------------
+        # --- NEW: receptive field, preset, weight ---------------------------
+        if bool(is_new.any()):
+            src_idx = ptr[:-1].unsqueeze(1) + torch.arange(S)
+            cell_emb = H[src_idx].view(B, 2, G2, -1).mean(1)                      # [B, G2, d]
+            cc = c.unsqueeze(1).expand(-1, G2, -1)
+            cell_logits = self.m_cell(torch.cat([cell_emb, cc], dim=2)).squeeze(-1)
+            a_cell = pick("a_cell", cell_logits, torch.ones(B, G2, dtype=torch.bool), is_new)
+            z_cell = cell_emb[rows, a_cell]
+            zc = torch.cat([z_cell, c], dim=1)
+            remaining = torch.tensor([m.remaining for m in masks])
+            fits = spec.rf_edge_table()[a_cell] <= remaining.view(-1, 1, 1)       # [B, R, 3]
+            a_rad = pick("a_radius", self.m_radius(zc), fits.any(-1), is_new)
+            r_onehot = F.one_hot(a_rad, len(spec.rf_radii)).float()
+            pick("a_pol", self.m_pol(torch.cat([zc, r_onehot], dim=1)), fits[rows, a_rad], is_new)
+            pick("a_node", self.m_node(zc), torch.ones(B, spec.num_presets, dtype=torch.bool), is_new)
+            w_new = pick("a_edge", self.m_wnew(zc), torch.ones(B, spec.num_edge_actions, dtype=torch.bool), is_new)
+        else:
+            for k in ("a_cell", "a_radius", "a_pol", "a_node"):
+                chosen[k] = torch.full((B,), -1)
+            w_new = torch.full((B,), -1)
 
-    def sample_actions(
-        self,
-        H: Tensor,
-        first_mask: Tensor | None = None,
-        second_mask: Tensor | None = None,
-    ) -> tuple[dict, LogProbs]:
-        """
-        Sample (a_stop, a_first, a_second, a_edge) from the current policy.
+        # --- CONNECT: tail, head, weight -------------------------------------
+        used_second: list[Tensor | None] = [None] * B
+        w_conn = torch.full((B,), -1)
+        if bool(is_conn.any()):
+            n_max = int(sizes.max())
+            valid = torch.zeros(B, n_max, dtype=torch.bool)
+            valid[gid, local] = True
 
-        Parameters
-        ----------
-        first_mask  : bool [n] — True = node may be selected as a_first
-        second_mask : bool [n] — True = node may be selected as a_second
-                      (does not cover the new-hidden option, which is always valid)
+            def padded(per_node: Tensor) -> Tensor:
+                out = torch.full((B, n_max), float("-inf"))
+                out[gid, local] = per_node
+                return out
 
-        Returns
-        -------
-        action : dict with keys a_first, a_second, a_edge, a_stop
-                 a_second uses the env sentinel NEW_NODE=-1 when applicable
-        log_probs : LogProbs namedtuple
-        """
-        n = H.size(0)
+            first_logits = padded(self.m_first(torch.cat([H, c[gid]], dim=1)).squeeze(-1))
+            fmask = torch.zeros(B, n_max, dtype=torch.bool)
+            for i, m in enumerate(masks):
+                fmask[i, : m.first.numel()] = m.first
+            a_first = pick("a_first", first_logits, fmask | (~is_conn.unsqueeze(1) & valid), is_conn)
+            z_first = H[ptr[:-1] + a_first]
 
-        # a_stop
-        d_stop = self.stop_dist(H)
-        a_stop = d_stop.sample()
-        lp_stop = d_stop.log_prob(a_stop)
+            second_logits = padded(self.m_second(torch.cat([z_first[gid], H, c[gid]], dim=1)).squeeze(-1))
+            smask = valid.clone()
+            for i in range(B):
+                if bool(is_conn[i]):
+                    sm = second_mask_fn(i, int(a_first[i])) if sample else second_masks[i]
+                    used_second[i] = sm
+                    smask[i] = False
+                    smask[i, : sm.numel()] = sm
+            a_second = pick("a_second", second_logits, smask, is_conn)
+            z_second = H[ptr[:-1] + a_second]
+            w_conn = pick("a_edge", self.m_wconn(torch.cat([z_first, z_second, c], dim=1)),
+                          torch.ones(B, spec.num_edge_actions, dtype=torch.bool), is_conn)
+        else:
+            chosen["a_first"] = chosen["a_second"] = torch.full((B,), -1)
 
-        # a_first
-        d_first = self.first_dist(H, mask=first_mask)
-        a_first = d_first.sample()
-        lp_first = d_first.log_prob(a_first)
-
-        # a_second  (index in [0..n], where n = new-hidden option)
-        d_second = self.second_dist(H, a_first, mask=second_mask)
-        a_second_raw = d_second.sample()      # in [0..n]
-        lp_second = d_second.log_prob(a_second_raw)
-
-        # a_edge
-        d_edge = self.edge_dist(H, a_first, a_second_raw)
-        a_edge = d_edge.sample()
-        lp_edge = d_edge.log_prob(a_edge)
-
-        # Convert a_second to env convention
-        a_second_env = int(a_second_raw.item()) if int(a_second_raw.item()) < n else NEW_NODE
-
-        action = {
-            "a_first":  int(a_first.item()),
-            "a_second": a_second_env,
-            "a_edge":   int(a_edge.item()),
-            "a_stop":   int(a_stop.item()),
-        }
-        log_probs = LogProbs(
-            first=lp_first,
-            second=lp_second,
-            edge=lp_edge,
-            stop=lp_stop,
-        )
-        return action, log_probs
-
-    # ------------------------------------------------------------------
-    # Re-evaluate log-probs for stored actions (PPO update)
-    # ------------------------------------------------------------------
-
-    def evaluate_log_probs(
-        self,
-        H: Tensor,
-        action: dict,
-        first_mask: Tensor | None = None,
-        second_mask: Tensor | None = None,
-    ) -> LogProbs:
-        """
-        Recompute log π_θ(a|s) under the current parameters for a stored action.
-        Used during PPO update to compute importance ratios.
-
-        action["a_second"] uses env convention (NEW_NODE = -1);
-        we convert back to tensor index n for the distribution query.
-        Masks must match those used during sampling to keep old/new log-probs comparable.
-        """
-        n = H.size(0)
-        a_first = action["a_first"]
-        a_second_env = action["a_second"]
-        a_second_raw = n if a_second_env == NEW_NODE else a_second_env
-        a_edge = action["a_edge"]
-        a_stop = action["a_stop"]
-
-        lp_first = self.first_dist(H, mask=first_mask).log_prob(
-            torch.tensor(a_first, device=H.device)
-        )
-        lp_second = self.second_dist(H, a_first, mask=second_mask).log_prob(
-            torch.tensor(a_second_raw, device=H.device)
-        )
-        lp_edge = self.edge_dist(H, a_first, a_second_raw).log_prob(
-            torch.tensor(a_edge, device=H.device)
-        )
-        lp_stop = self.stop_dist(H).log_prob(
-            torch.tensor(a_stop, device=H.device)
-        )
-
-        return LogProbs(first=lp_first, second=lp_second, edge=lp_edge, stop=lp_stop)
-
-    def entropy(self, H: Tensor) -> Tensor:
-        """
-        Approximate joint entropy: H(stop) + H(first).
-        (Full conditional entropy over all heads is expensive to compute exactly.)
-        """
-        return self.stop_dist(H).entropy() + self.first_dist(H).entropy()
+        chosen["a_edge"] = torch.where(is_new, w_new, torch.where(is_conn, w_conn, torch.full((B,), -1)))
+        out = []
+        for i in range(B):
+            if not bool(is_cont[i]):
+                out.append(dict(STOP_ACTION))
+            else:
+                out.append({k: int(chosen[k][i]) for k in STOP_ACTION})
+        return out, logp, ent, used_second

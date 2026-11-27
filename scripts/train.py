@@ -3,382 +3,302 @@ SpikeGCPN training entry point.
 
 Usage
 -----
-  python scripts/train.py                          # uses configs/default.yaml
-  python scripts/train.py --config configs/my.yaml
-  python scripts/train.py --resume experiments/checkpoints/ep500.pt
+  python scripts/train.py --algo gflownet                    # configs/default.yaml
+  python scripts/train.py --algo grpo --no-surrogate
+  python scripts/train.py --algo random                      # random-topology baseline
+  python scripts/train.py --config configs/smoke.yaml --algo grpo
+  python scripts/train.py --resume experiments/<run>/ckpt.pt
 
-Episode loop
-------------
-1. env.reset()  → initial graph (sources + sinks, no hidden, no edges)
-2. For each step:
-   a. Encode graph with GCNEncoder → node embeddings H
-   b. Sample action from PolicyHead
-   c. env.step(action) → next graph, step reward, done
-   d. If done (a_stop=1): call simulator to get accuracy → add terminal reward
-   e. Store Transition in RolloutBuffer
-3. PPOTrainer.update(buffer) → gradient step
-4. Every eval_interval episodes: run a larger evaluation and log accuracy
+Iteration
+---------
+1. Sample `group_size` topologies (policy, or uniformly random for `random`).
+2. Score them through the RewardOracle. A "simulator call" is one topology
+   evaluation, depending on `inner.mode`:
+     reservoir : simulate with fixed weights, fit a logistic-regression readout
+                 on every neuron's windowed spike counts → validation accuracy
+     bptt      : train weights / thresholds / leaks with surrogate-gradient
+                 BPTT, read out sink spike counts → validation accuracy
+   With `inner.enabled: false` the topology is scored as-is by sink counts.
+   The surrogate model (if enabled) decides which topologies get evaluated.
+3. GRPO: group-normalised clipped policy-gradient update.
+   GFlowNet: trajectory-balance update on fresh + replayed trajectories.
+4. Log a CSV row; stop at max_iters or when sim_budget evaluations are used.
+
+The reward function (data subsets and inner-training seed) is fixed by
+`simulator.data_seed` and `inner.seed`, not by the run seed, so every run and
+algorithm optimises the same objective.
+
+Outputs go to experiments/<run_name>/: metrics.csv, config.yaml, ckpt.pt,
+best_graph.pt (trained), summary.yaml (SuperNeuroMAT-verified val + Test accuracy).
 """
 
 from __future__ import annotations
 
 import argparse
-import os
+import csv
+import random
 import sys
 import time
 from pathlib import Path
 
-import yaml
+import numpy as np
 import torch
-from torch_geometric.data import Data
+import yaml
 
-# Allow running from the project root without installing the package
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from spikegcpn.env.snn_env import SNNEnv
-from spikegcpn.model.encoder import GCNEncoder
+from spikegcpn.data.nmnist import load_samples
+from spikegcpn.env.snn_env import GraphSpec, SNNEnv
+from spikegcpn.env.validity import is_dag
+from spikegcpn.model.encoder import GraphEncoder
 from spikegcpn.model.policy import PolicyHead
-from spikegcpn.model.value import ValueFunction
-from spikegcpn.train.ppo import PPOTrainer, PPOConfig, RolloutBuffer, Transition, _clone_graph
-from spikegcpn.train.rewards import RewardConfig, step_reward, terminal_reward
-from spikegcpn.simulator.wrapper import evaluate, imprint
-from spikegcpn.data.nmnist import NUM_SOURCE_NODES, NUM_CLASSES
+from spikegcpn.model.surrogate import SurrogateEnsemble
+from spikegcpn.simulator.wrapper import evaluate_samples, window_spike_counts
+from spikegcpn.train.gflownet import TBConfig, TBTrainer
+from spikegcpn.train.grpo import GRPOConfig, GRPOTrainer
+from spikegcpn.train.inner import InnerConfig, InnerTrainer, split_per_class, stack_samples
+from spikegcpn.train.oracle import RewardOracle
+from spikegcpn.train.readout import ReadoutConfig, ReservoirEvaluator, input_readout_baselines
+from spikegcpn.train.rewards import RewardConfig, log_reward, shaped_reward
+from spikegcpn.train.rollout import sample_random_trajectory, sample_trajectories
 
 
-# ---------------------------------------------------------------------------
-# Config helpers
-# ---------------------------------------------------------------------------
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+def _dc(cls, d: dict | None):
+    d = d or {}
+    return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
-def _get(cfg: dict, *keys, default=None):
-    """Nested dict lookup with a default."""
-    d = cfg
-    for k in keys:
-        if not isinstance(d, dict) or k not in d:
-            return default
-        d = d[k]
-    return d
+def train(cfg: dict, resume: str | None = None) -> dict:
+    seed = int(cfg.get("seed", 0))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.set_num_threads(int(cfg.get("threads", 1)))
+    rng = random.Random(seed)
 
+    algo = cfg["algo"]
+    tcfg = cfg.get("train", {})
+    scfg = cfg.get("simulator", {})
+    sur_cfg = cfg.get("surrogate", {})
+    icfg = cfg.get("inner", {})
+    mcfg = cfg.get("model", {})
+    reward_cfg = _dc(RewardConfig, cfg.get("rewards"))
 
-# ---------------------------------------------------------------------------
-# Quick accuracy estimate (called after every episode)
-# ---------------------------------------------------------------------------
+    spec = GraphSpec.from_config(cfg.get("env", {}))
+    env = SNNEnv(spec)
+    encoder = GraphEncoder(spec.num_sink, mcfg.get("embed_dim", 64), mcfg.get("num_layers", 3))
+    policy = PolicyHead(spec, mcfg.get("embed_dim", 64), mcfg.get("mlp_hidden", 128))
 
-def quick_accuracy(
-    graph: Data,
-    nmnist_root: str,
-    num_bins: int,
-    n_samples: int,
-    num_source: int,
-    num_sink: int,
-) -> float:
-    """
-    Run a small N-MNIST evaluation on the final topology.
-    Uses per_class=ceil(n_samples/10) to keep the sample balanced.
-    """
-    per_cls = max(1, n_samples // NUM_CLASSES)
-    try:
-        return evaluate(
-            data=graph,
-            nmnist_root=nmnist_root,
-            num_source=num_source,
-            num_sink=num_sink,
-            num_bins=num_bins,
-            per_class=per_cls,
-            split="Test",
+    # --- reward pipeline (fixed across runs) -----------------------------
+    root, bins, patch = scfg.get("nmnist_root", "data/NMNIST"), scfg.get("num_bins", 50), spec.patch_size
+    dseed = scfg.get("data_seed", 0)
+    n_train, n_val = icfg.get("train_per_class", 100), scfg.get("val_per_class", 50)
+    pool = load_samples(root, scfg.get("reward_split", "Train"), bins, n_train + n_val, None, True, dseed, patch)
+    train_samples, val_samples = split_per_class(pool, n_train)
+    test_samples = load_samples(root, scfg.get("test_split", "Test"), bins,
+                                scfg.get("test_per_class", 50), None, True, dseed, patch)
+
+    use_inner = icfg.get("enabled", True)
+    mode = icfg.get("mode", "bptt") if use_inner else "none"
+    if spec.allow_cycles and mode != "reservoir":
+        raise ValueError("recurrent topologies (allow_cycles) are only supported with inner.mode: reservoir")
+    inner = reservoir = None
+    baselines: dict = {}
+    if mode == "bptt":
+        inner = InnerTrainer(spec.num_source, spec.num_sink, stack_samples(train_samples),
+                             stack_samples(val_samples), _dc(InnerConfig, icfg))
+
+        def simulate(graphs):
+            return inner.train_and_eval(graphs)[0]
+    elif mode == "reservoir":
+        rcfg = _dc(ReadoutConfig, icfg)
+        extra_ticks = int(icfg.get("extra_ticks", 10))
+        tr_set, va_set = stack_samples(train_samples), stack_samples(val_samples)
+        reservoir = ReservoirEvaluator(spec.num_source, spec.num_sink, tr_set, va_set, rcfg, extra_ticks)
+        baselines = input_readout_baselines(tr_set, va_set, spec.num_sink, rcfg,
+                                            matched_neurons=spec.num_sink + spec.max_hidden)
+        print("input-readout baselines:", baselines, flush=True)
+
+        def simulate(graphs):
+            return reservoir.train_and_eval(graphs)[0]
+    else:
+        def simulate(graphs):
+            return [evaluate_samples(g, val_samples, spec.num_source, spec.num_sink) for g in graphs]
+
+    surrogate = None
+    if sur_cfg.get("enabled", True):
+        surrogate = SurrogateEnsemble(
+            spec, sur_cfg.get("ensemble_size", 4), sur_cfg.get("embed_dim", 32),
+            sur_cfg.get("num_layers", 2), sur_cfg.get("lr", 1e-3), seed,
         )
-    except Exception as e:
-        # Gracefully handle invalid graphs (e.g. sinks not reachable at episode end)
-        print(f"  [warn] evaluate() failed: {e}")
-        return 0.0
+    oracle = RewardOracle(
+        simulate, surrogate,
+        warmup=sur_cfg.get("warmup", 64),
+        sim_per_batch=sur_cfg.get("sim_per_batch", 4),
+        ucb_kappa=sur_cfg.get("ucb_kappa", 1.0),
+        refit_every=sur_cfg.get("refit_every", 16),
+        refit_steps=sur_cfg.get("refit_steps", 50),
+    )
 
+    # --- trainer ---------------------------------------------------------
+    trainer = None
+    temperature, eps = 1.0, 0.0
+    if algo == "grpo":
+        trainer = GRPOTrainer(encoder, policy, _dc(GRPOConfig, cfg.get("grpo")), seed)
+    elif algo == "gflownet":
+        tb_cfg = _dc(TBConfig, cfg.get("gflownet"))
+        trainer = TBTrainer(encoder, policy, tb_cfg, seed)
+        temperature, eps = tb_cfg.temperature, tb_cfg.explore_eps
+    elif algo != "random":
+        raise ValueError(f"unknown algo {algo!r}")
+    if resume and trainer is not None:
+        trainer.load_state_dict(torch.load(resume, weights_only=False)["trainer"])
 
-# ---------------------------------------------------------------------------
-# Single episode rollout
-# ---------------------------------------------------------------------------
+    sur_tag = "" if surrogate is not None else "_nosur"
+    run_name = cfg.get("run_name") or f"{algo}{sur_tag}_s{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+    out = Path(tcfg.get("out_dir", "experiments")) / run_name
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
 
-def run_episode(
-    env: SNNEnv,
-    encoder: GCNEncoder,
-    policy: PolicyHead,
-    value_fn: ValueFunction,
-    buffer: RolloutBuffer,
-    reward_cfg: RewardConfig,
-    sim_cfg: dict,
-    max_steps: int,
-) -> dict:
-    """
-    Run one episode and fill `buffer` with Transitions.
+    group_size = tcfg.get("group_size", 16)
+    max_iters = tcfg.get("max_iters", 500)
+    sim_budget = tcfg.get("sim_budget", 10**9)
+    ckpt_interval = tcfg.get("checkpoint_interval", 50)
 
-    Returns episode statistics dict.
-    """
-    obs, _ = env.reset()
-    buffer.clear()
+    fields = ["iter", "wall_s", "sim_calls", "acc_mean", "acc_max", "frac_sim", "frac_cache",
+              "reward_mean", "best_sim_acc", "edges_mean", "hidden_mean", "unique_frac",
+              "loss", "aux", "surrogate_mse"]
+    f = open(out / "metrics.csv", "w", newline="")
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
 
-    ep_reward = 0.0
-    ep_steps = 0
-    accuracy = 0.0
+    print(f"[{run_name}] algo={algo} surrogate={'on' if surrogate is not None else 'off'} "
+          f"inner={mode} cycles={spec.allow_cycles} sources={spec.num_source} group={group_size} "
+          f"budget={sim_budget} evals  →  {out}", flush=True)
+    t0 = time.time()
+    it = 0
+    for it in range(1, max_iters + 1):
+        if algo == "random":
+            trajs = [sample_random_trajectory(env, rng) for _ in range(group_size)]
+        else:
+            trajs = sample_trajectories(spec, encoder, policy, group_size, temperature, eps)
 
-    for step_idx in range(max_steps):
-        g = obs
-        is_last_step = (step_idx == max_steps - 1)
-        first_mask = env.valid_first_mask()
-        second_mask = env.valid_second_mask()
+        scores = oracle.score([t.final for t in trajs], [t.key for t in trajs])
+        accs = [s.accuracy for s in scores]
+        rewards = [shaped_reward(a, t.num_hidden, t.num_edges, reward_cfg) for a, t in zip(accs, trajs)]
 
-        with torch.no_grad():
-            H = encoder(g.x, g.edge_index, g.edge_attr)
-            value = value_fn(H).item()
-            action, log_probs = policy.sample_actions(
-                H, first_mask=first_mask, second_mask=second_mask
-            )
+        if algo == "grpo":
+            stats = trainer.update(trajs, rewards)
+            aux = f"kl={stats['approx_kl']:.4f} clip={stats['clip_frac']:.3f} ent={stats['entropy']:.2f}"
+        elif algo == "gflownet":
+            log_rs = [log_reward(a, t.num_hidden, t.num_edges, reward_cfg) for a, t in zip(accs, trajs)]
+            for t, lr in zip(trajs, log_rs):
+                trainer.replay.add(t, lr)
+            replayed = trainer.replay.sample(trainer.cfg.replay_batch)
+            if replayed:
+                rs = oracle.score([t.final for t in replayed], [t.key for t in replayed], allow_sim=False)
+                log_rs += [log_reward(s.accuracy, t.num_hidden, t.num_edges, reward_cfg) for s, t in zip(rs, replayed)]
+            stats = trainer.update(trajs + replayed, log_rs)
+            aux = f"logZ={stats['log_z']:.1f} logPF={stats['mean_log_pf']:.1f} gn={stats['grad_norm']:.1f}"
+        else:
+            stats, aux = {"loss": 0.0}, ""
 
-        obs_next, r_step, terminated, truncated, info = env.step(action)
-        truncated = truncated or is_last_step  # force truncation flag on last step
-        done = terminated or truncated
+        best = oracle.best()
+        row = {
+            "iter": it,
+            "wall_s": round(time.time() - t0, 1),
+            "sim_calls": oracle.sim_calls,
+            "acc_mean": round(float(np.mean(accs)), 4),
+            "acc_max": round(float(np.max(accs)), 4),
+            "frac_sim": round(sum(s.source == "sim" for s in scores) / len(scores), 3),
+            "frac_cache": round(sum(s.source == "cache" for s in scores) / len(scores), 3),
+            "reward_mean": round(float(np.mean(rewards)), 4),
+            "best_sim_acc": round(best[1], 4) if best else 0.0,
+            "edges_mean": round(float(np.mean([t.num_edges for t in trajs])), 1),
+            "hidden_mean": round(float(np.mean([t.num_hidden for t in trajs])), 1),
+            "unique_frac": round(len({t.key for t in trajs}) / len(trajs), 3),
+            "loss": round(stats["loss"], 4),
+            "aux": aux,
+            "surrogate_mse": round(oracle.last_fit_mse, 5) if surrogate is not None else "",
+        }
+        writer.writerow(row)
+        f.flush()
+        if it % tcfg.get("log_interval", 5) == 0 or it == 1:
+            print(f"it {it:4d} | evals {row['sim_calls']:5d} | acc {row['acc_mean']:.3f} (max {row['acc_max']:.3f}) "
+                  f"| best {row['best_sim_acc']:.3f} | E {row['edges_mean']:5.1f} H {row['hidden_mean']:4.1f} "
+                  f"| uniq {row['unique_frac']:.2f} | loss {row['loss']:.3g} | {aux} | {row['wall_s']:.0f}s",
+                  flush=True)
 
-        # Step reward: tiny positive for valid moves, tiny negative for invalid.
-        # Kept very small so accumulated steps never dominate the terminal signal.
-        valid = "invalid" not in info
-        r = step_reward(valid, reward_cfg)
-
-        # Terminal reward on explicit stop (a_stop=1)
-        if terminated:
-            accuracy = quick_accuracy(
-                graph=g,
-                nmnist_root=sim_cfg["nmnist_root"],
-                num_bins=sim_cfg["num_bins"],
-                n_samples=sim_cfg["train_eval_samples"],
-                num_source=env.num_source,
-                num_sink=env.num_sink,
-            )
-            r += terminal_reward(
-                accuracy=accuracy,
-                num_hidden=env._num_hidden,
-                num_edges=int(g.edge_index.shape[1]),
-                cfg=reward_cfg,
-            )
-        elif truncated:
-            # Penalty for hitting max_steps without stopping: ensures the policy
-            # prefers to stop early even with low accuracy vs. running out the clock.
-            r -= reward_cfg.truncation_penalty
-
-        # Store masks alongside the graph snapshot so the PPO update can
-        # reconstruct the same distributions
-        lp_total = log_probs.total().item()
-        buffer.push(Transition(
-            graph=_clone_graph(g),
-            action=action,
-            log_prob=lp_total,
-            reward=r,
-            value=value,
-            done=done,
-            first_mask=first_mask,
-            second_mask=second_mask,
-        ))
-
-        ep_reward += r
-        ep_steps += 1
-
-        if done:
+        if trainer is not None and it % ckpt_interval == 0:
+            torch.save({"trainer": trainer.state_dict(), "iter": it}, out / "ckpt.pt")
+        if oracle.sim_calls >= sim_budget:
+            print(f"evaluation budget reached ({oracle.sim_calls})")
             break
-        obs = obs_next
+    f.close()
+    if trainer is not None:
+        torch.save({"trainer": trainer.state_dict(), "iter": it}, out / "ckpt.pt")
 
-    # If the episode ended by hitting max_steps (truncated, never stopped),
-    # evaluate accuracy on the final graph so the metric is always visible.
-    if accuracy == 0.0 and len(buffer) > 0:
-        accuracy = quick_accuracy(
-            graph=env.graph,
-            nmnist_root=sim_cfg["nmnist_root"],
-            num_bins=sim_cfg["num_bins"],
-            n_samples=sim_cfg["train_eval_samples"],
-            num_source=env.num_source,
-            num_sink=env.num_sink,
-        )
+    # --- verify the best topology in SuperNeuroMAT -------------------------
+    summary: dict = {"run": run_name, "algo": algo, "surrogate": surrogate is not None,
+                     "inner": mode, "allow_cycles": spec.allow_cycles, "iters": it,
+                     "sim_calls": oracle.sim_calls, "wall_s": round(time.time() - t0, 1)}
+    summary.update({k: round(v, 4) if isinstance(v, float) else v for k, v in baselines.items()})
+    best = oracle.best()
+    if best:
+        g = oracle.graphs[best[0]]
+        summary.update(best_val_acc=round(best[1], 4), best_edges=int(g.edge_index.shape[1]),
+                       best_hidden=int(g.num_nodes - spec.hidden_start),
+                       best_recurrent=bool(spec.allow_cycles and not is_dag(g.edge_index, g.num_nodes)))
+        if reservoir is not None:
+            # Refit the readout (deterministic), then recompute the reservoir features in
+            # SuperNeuroMAT itself and apply the readout → val / Test accuracy.
+            _, (ro,) = reservoir.train_and_eval([g])
+            W = reservoir.cfg.windows
+            accs = {}
+            for name, samples in (("val", val_samples), ("test", test_samples)):
+                feats = torch.from_numpy(window_spike_counts(
+                    g, samples, spec.num_source, spec.num_sink, reservoir.extra_ticks, W)).reshape(len(samples), -1)
+                labels = torch.tensor([smp.label for smp in samples])
+                accs[name] = float((ro.predict(feats.double()) == labels).double().mean())
+            summary.update(best_val_acc_superneuromat=round(accs["val"], 4), best_test_acc=round(accs["test"], 4))
+            test_in = input_readout_baselines(stack_samples(train_samples), stack_samples(test_samples),
+                                              spec.num_sink, reservoir.cfg, spec.num_sink + spec.max_hidden)
+            summary.update(test_input_readout_all=round(test_in["input_readout_all"], 4),
+                           test_input_readout_matched=round(test_in["input_readout_matched"], 4))
+        else:
+            if inner is not None:
+                _, (g,) = inner.train_and_eval([g])   # deterministic: same parameters as during search
+            summary.update(
+                best_val_acc_superneuromat=round(evaluate_samples(g, val_samples, spec.num_source, spec.num_sink), 4),
+                best_test_acc=round(evaluate_samples(g, test_samples, spec.num_source, spec.num_sink), 4))
+        torch.save(g, out / "best_graph.pt")
+    (out / "summary.yaml").write_text(yaml.safe_dump(summary, sort_keys=False))
+    print("summary:", summary, flush=True)
+    return summary
 
-    return {
-        "ep_reward": ep_reward,
-        "ep_steps": ep_steps,
-        "accuracy": accuracy,
-        "num_hidden": env._num_hidden,
-        "num_edges": int(env.graph.edge_index.shape[1]),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main training loop
-# ---------------------------------------------------------------------------
-
-def train(cfg: dict, resume: str | None = None) -> None:
-    env_cfg  = cfg.get("env", {})
-    model_cfg = cfg.get("model", {})
-    train_cfg = cfg.get("train", {})
-    sim_cfg   = cfg.get("simulator", {})
-    rew_cfg   = cfg.get("rewards", {})
-
-    # --- Environment ---
-    env = SNNEnv(
-        num_source=env_cfg.get("num_source", NUM_SOURCE_NODES),
-        num_sink=env_cfg.get("num_sink", NUM_CLASSES),
-        max_hidden=env_cfg.get("max_hidden", 50),
-        default_threshold=env_cfg.get("default_threshold", 0.5),
-        default_leak=env_cfg.get("default_leak", float("inf")),
-    )
-
-    # --- Models ---
-    encoder = GCNEncoder(
-        node_feat_dim=model_cfg.get("node_feat_dim", 5),
-        embed_dim=model_cfg.get("embed_dim", 64),
-        num_layers=model_cfg.get("num_layers", 3),
-        num_edge_types=model_cfg.get("num_edge_types", 2),
-    )
-    policy = PolicyHead(
-        embed_dim=model_cfg.get("embed_dim", 64),
-        mlp_hidden=model_cfg.get("mlp_hidden", 64),
-    )
-    value_fn = ValueFunction(
-        embed_dim=model_cfg.get("embed_dim", 64),
-        mlp_hidden=model_cfg.get("mlp_hidden", 64),
-    )
-
-    # --- PPO ---
-    ppo_cfg = PPOConfig(
-        lr=train_cfg.get("lr", 1e-3),
-        gamma=train_cfg.get("gamma", 0.99),
-        gae_lambda=train_cfg.get("gae_lambda", 0.95),
-        clip_eps=train_cfg.get("clip_eps", 0.2),
-        ppo_epochs=train_cfg.get("ppo_epochs", 4),
-        value_coeff=train_cfg.get("value_coeff", 0.5),
-        entropy_coeff=train_cfg.get("entropy_coeff", 0.01),
-        max_grad_norm=train_cfg.get("max_grad_norm", 0.5),
-    )
-    trainer = PPOTrainer(encoder, policy, value_fn, ppo_cfg)
-
-    if resume:
-        trainer.load(resume)
-        print(f"Resumed from {resume}")
-
-    reward_cfg = RewardConfig(
-        validity_step=rew_cfg.get("validity_step", 0.001),
-        invalid_step=rew_cfg.get("invalid_step", -0.01),
-        efficiency_coeff=rew_cfg.get("efficiency_coeff", 0.0005),
-        truncation_penalty=rew_cfg.get("truncation_penalty", 0.5),
-    )
-
-    ckpt_dir = Path(train_cfg.get("checkpoint_dir", "experiments/checkpoints"))
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    max_episodes       = train_cfg.get("max_episodes", 10000)
-    max_steps          = train_cfg.get("max_steps_per_episode", 100)
-    log_interval       = train_cfg.get("log_interval", 10)
-    eval_interval      = train_cfg.get("eval_interval", 100)
-    ckpt_interval      = train_cfg.get("checkpoint_interval", 500)
-
-    sim_dict = {
-        "nmnist_root":       sim_cfg.get("nmnist_root", "data/NMNIST"),
-        "num_bins":          sim_cfg.get("num_bins", 100),
-        "train_eval_samples": sim_cfg.get("train_eval_samples", 50),
-        "full_eval_samples":  sim_cfg.get("full_eval_samples", 500),
-        "eval_split":         sim_cfg.get("eval_split", "Test"),
-    }
-
-    buffer = RolloutBuffer()
-
-    # Running averages for logging
-    recent_rewards: list[float] = []
-    recent_acc: list[float] = []
-
-    print("=" * 60)
-    print("SpikeGCPN training")
-    print(f"  Episodes : {max_episodes}")
-    print(f"  Max steps: {max_steps}")
-    print(f"  N-MNIST  : {sim_dict['nmnist_root']}")
-    print("=" * 60)
-
-    for ep in range(1, max_episodes + 1):
-        t0 = time.time()
-
-        stats = run_episode(
-            env, encoder, policy, value_fn,
-            buffer, reward_cfg, sim_dict, max_steps,
-        )
-
-        ppo_stats = trainer.update(buffer)
-        buffer.clear()
-
-        recent_rewards.append(stats["ep_reward"])
-        recent_acc.append(stats["accuracy"])
-
-        if ep % log_interval == 0:
-            mean_r = sum(recent_rewards) / len(recent_rewards)
-            mean_a = sum(recent_acc) / len(recent_acc)
-            recent_rewards.clear()
-            recent_acc.clear()
-            elapsed = time.time() - t0
-            print(
-                f"ep {ep:>6d} | "
-                f"reward {mean_r:+.4f} | "
-                f"acc {mean_a*100:5.1f}% | "
-                f"hidden {stats['num_hidden']:>3d} | "
-                f"edges {stats['num_edges']:>4d} | "
-                f"pl {ppo_stats['policy_loss']:+.4f} | "
-                f"vl {ppo_stats['value_loss']:.4f} | "
-                f"ent {ppo_stats['entropy']:.3f} | "
-                f"{elapsed:.1f}s"
-            )
-
-        if ep % eval_interval == 0:
-            print(f"\n--- Full eval at episode {ep} ---")
-            obs, _ = env.reset()
-            # Run a full episode greedily (no grad) and evaluate
-            with torch.no_grad():
-                for _ in range(max_steps):
-                    H = encoder(obs.x, obs.edge_index, obs.edge_attr)
-                    action, _ = policy.sample_actions(H)
-                    obs, _, terminated, truncated, _ = env.step(action)
-                    if terminated or truncated:
-                        break
-            acc_full = quick_accuracy(
-                graph=obs,
-                nmnist_root=sim_dict["nmnist_root"],
-                num_bins=sim_dict["num_bins"],
-                n_samples=sim_dict["full_eval_samples"],
-                num_source=env.num_source,
-                num_sink=env.num_sink,
-            )
-            print(f"  Accuracy ({sim_dict['full_eval_samples']} samples): {acc_full*100:.2f}%")
-            print()
-
-        if ep % ckpt_interval == 0:
-            ckpt_path = ckpt_dir / f"ep{ep:06d}.pt"
-            trainer.save(str(ckpt_path))
-            print(f"  [ckpt] saved {ckpt_path}")
-
-    # Final checkpoint
-    trainer.save(str(ckpt_dir / "final.pt"))
-    print("Training complete.")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train SpikeGCPN")
-    parser.add_argument(
-        "--config", default="configs/default.yaml",
-        help="Path to YAML config file",
-    )
-    parser.add_argument(
-        "--resume", default=None,
-        help="Path to a checkpoint to resume from",
-    )
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Train SpikeGCPN")
+    p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--algo", choices=["grpo", "gflownet", "random"], help="overrides config 'algo'")
+    p.add_argument("--no-surrogate", action="store_true", help="evaluate every sampled topology")
+    p.add_argument("--no-inner", action="store_true", help="score topologies with fixed weights (no training)")
+    p.add_argument("--seed", type=int)
+    p.add_argument("--run-name")
+    p.add_argument("--resume")
+    args = p.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = yaml.safe_load(open(args.config))
+    if args.algo:
+        cfg["algo"] = args.algo
+    if args.no_surrogate:
+        cfg.setdefault("surrogate", {})["enabled"] = False
+    if args.no_inner:
+        cfg.setdefault("inner", {})["enabled"] = False
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    if args.run_name:
+        cfg["run_name"] = args.run_name
     train(cfg, resume=args.resume)
 
 

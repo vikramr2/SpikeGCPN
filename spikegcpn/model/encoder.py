@@ -1,177 +1,123 @@
 """
-Edge-conditioned GCN encoder from GCPN (You et al., NeurIPS 2018), Section 3.4.
+Relational graph encoder for SNN topologies.
 
-Equation 2:
-  H^(l+1) = ReLU( SUM_i( D̃_i^{-1/2}  Ẽ_i  D̃_i^{-1/2}  H^(l)  W_i^(l) ) )
+Changes from the original GCPN encoder (You et al. 2018, Eq. 2):
 
-where i indexes edge types (excitatory=0, inhibitory=1),
-      Ẽ_i = E_i + I  (self-loops added per edge type),
-      D̃_i is the degree matrix of Ẽ_i.
+* Bidirectional message passing. Each edge type (excitatory / inhibitory) is
+  split into a forward relation (tail → head) and a backward relation
+  (head → tail), each with its own weights. With forward-only passing a source
+  neuron (in-degree 0) never receives messages, so all sources had identical
+  embeddings and a_first was exactly uniform over pixels.
+* Node identity features. Sources get Fourier features of their (x, y) pixel
+  position plus polarity; sinks get a learned per-class embedding. Without
+  these, the 2312 sources and 10 sinks are indistinguishable at reset.
+* Messages are scaled by |weight| so synaptic strength is visible.
+* Mean aggregation per relation, residual connections and LayerNorm
+  (BatchNorm over the nodes of a single graph made embeddings depend on the
+  batch composition of that graph).
 
-BatchNorm is applied after each ReLU layer, as in the paper's experimental setup.
-
-SNN adaptation:
-- Two edge types: excitatory (weight > 0) and inhibitory (weight ≤ 0).
-- Node features [threshold, leak, reset_state, refractory_period, node_type] are
-  projected to embed_dim before the first GCN layer.
-- leak=inf is normalised to 0 (1/(1+leak)) so it is finite for linear layers.
+Input features follow snn_env.py:
+  [threshold, leak, reset, refractory, node_type, pos_x, pos_y, polarity, sink_id]
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-NODE_FEAT_DIM = 5
-EMBED_DIM = 64
-NUM_LAYERS = 3
-NUM_EDGE_TYPES = 2  # excitatory, inhibitory
+from spikegcpn.env.snn_env import (
+    THR, LEAK, RESET, REFRAC, TYPE, PX, PY, POL, SINK_ID, SOURCE, SINK,
+)
+
+NUM_RELATIONS = 4  # (exc, inh) × (fwd, bwd)
 
 
-class _GCNLayer(nn.Module):
-    """
-    One layer of the edge-conditioned GCN (Eq. 2):
-      out = SUM_i( sym_norm(E_i + I) @ H @ W_i )
-    followed by ReLU + BatchNorm.
-    """
-
-    def __init__(self, in_dim: int, out_dim: int, num_edge_types: int):
+class _RelLayer(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
-        self.num_edge_types = num_edge_types
-        self.weights = nn.ModuleList(
-            [nn.Linear(in_dim, out_dim, bias=False) for _ in range(num_edge_types)]
-        )
-        self.bn = nn.BatchNorm1d(out_dim)
+        self.self_lin = nn.Linear(dim, dim)
+        self.rel_lins = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(NUM_RELATIONS)])
+        self.norm = nn.LayerNorm(dim)
 
-    def forward(self, h: Tensor, edge_index: Tensor, edge_type: Tensor) -> Tensor:
-        n = h.size(0)
-        dev = h.device
-        agg = torch.zeros(n, self.weights[0].out_features, device=dev)
-
-        for i, lin in enumerate(self.weights):
-            # Edges of type i + self-loops
-            if edge_index.numel() > 0:
-                mask = edge_type == i
-                ei = edge_index[:, mask]
-            else:
-                ei = torch.zeros(2, 0, dtype=torch.long, device=dev)
-
-            # Self-loops: every node connects to itself for this edge type
-            loop_idx = torch.arange(n, device=dev)
-            loop_ei = torch.stack([loop_idx, loop_idx], dim=0)
-            ei = torch.cat([ei, loop_ei], dim=1)
-
-            src, dst = ei[0], ei[1]
-
-            # Symmetric normalisation: D̃^{-1/2}
-            deg = torch.zeros(n, device=dev)
-            deg.scatter_add_(0, dst, torch.ones(dst.size(0), device=dev))
-            inv_sqrt_deg = deg.pow(-0.5)
-            inv_sqrt_deg[inv_sqrt_deg.isinf()] = 0.0
-
-            # W H  (transform first, cheaper)
-            Wh = lin(h)                             # [n, out_dim]
-            msg = inv_sqrt_deg[src].unsqueeze(1) * Wh[src]
-
-            contrib = torch.zeros_like(agg)
-            contrib.scatter_add_(0, dst.unsqueeze(1).expand_as(msg), msg)
-            contrib = inv_sqrt_deg.unsqueeze(1) * contrib
-
-            agg = agg + contrib
-
-        return self.bn(F.relu(agg))
+    def forward(self, h: Tensor, rels: list[tuple[int, Tensor, Tensor, Tensor]], dst_all: Tensor) -> Tensor:
+        out = self.self_lin(h)
+        msgs = [self.rel_lins[r](h[src]) * coef.unsqueeze(1) for r, src, _, coef in rels]
+        if msgs:
+            out = out.index_add(0, dst_all, torch.cat(msgs))
+        return self.norm(h + F.relu(out))
 
 
-class GCNEncoder(nn.Module):
-    """
-    3-layer edge-conditioned GCN producing 64-dim node embeddings (GCPN §3.4).
-
-    Input node features (5 columns):
-      0: threshold
-      1: leak          (normalised: 1/(1+leak), so inf→0)
-      2: reset_state
-      3: refractory_period
-      4: node_type     (0=source, 1=hidden, 2=sink)
-    """
-
+class GraphEncoder(nn.Module):
     def __init__(
         self,
-        node_feat_dim: int = NODE_FEAT_DIM,
-        embed_dim: int = EMBED_DIM,
-        num_layers: int = NUM_LAYERS,
-        num_edge_types: int = NUM_EDGE_TYPES,
+        num_sink: int,
+        embed_dim: int = 64,
+        num_layers: int = 3,
+        num_fourier: int = 6,
     ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.register_buffer("freqs", (2.0 ** torch.arange(num_fourier)) * math.pi, persistent=False)
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(node_feat_dim, embed_dim),
-            nn.ReLU(),
-        )
+        self.cont_proj = nn.Linear(4, embed_dim)            # threshold, leak, reset, refractory
+        self.type_emb = nn.Embedding(3, embed_dim)
+        self.sink_emb = nn.Embedding(num_sink, embed_dim)
+        self.pos_proj = nn.Linear(4 * num_fourier + 1, embed_dim)
+        self.layers = nn.ModuleList([_RelLayer(embed_dim) for _ in range(num_layers)])
 
-        self.layers = nn.ModuleList(
-            [_GCNLayer(embed_dim, embed_dim, num_edge_types) for _ in range(num_layers)]
-        )
+    def embed_nodes(self, x: Tensor) -> Tensor:
+        x = x.float()
+        cont = torch.stack([
+            x[:, THR],
+            1.0 / (1.0 + x[:, LEAK].clamp(min=0.0, max=1e6)),   # leak ∈ [0, inf] → (0, 1]
+            x[:, RESET],
+            x[:, REFRAC],
+        ], dim=1)
+        ntype = x[:, TYPE].long()
+        h = self.cont_proj(cont) + self.type_emb(ntype)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        is_src = ntype == SOURCE
+        if is_src.any():
+            xy = x[is_src][:, [PX, PY]]                                      # [s, 2]
+            ang = xy.unsqueeze(-1) * self.freqs                              # [s, 2, F]
+            four = torch.cat([ang.sin(), ang.cos()], dim=-1).flatten(1)      # [s, 4F]
+            pos_in = torch.cat([four, x[is_src][:, POL:POL + 1]], dim=1)
+            h = h.index_add(0, is_src.nonzero(as_tuple=True)[0], self.pos_proj(pos_in))
 
-    def forward(
-        self,
-        x: Tensor,
-        edge_index: Tensor,
-        edge_attr: Tensor | None,
-    ) -> Tensor:
+        is_sink = ntype == SINK
+        if is_sink.any():
+            h = h.index_add(0, is_sink.nonzero(as_tuple=True)[0], self.sink_emb(x[is_sink][:, SINK_ID].long()))
+        return F.relu(h)
+
+    @staticmethod
+    def relations(edge_index: Tensor, edge_attr: Tensor | None, n: int):
         """
-        Parameters
-        ----------
-        x          : [n, node_feat_dim]
-        edge_index : [2, E]  (COO directed edges)
-        edge_attr  : [E, 2]  columns [weight, delay]; None if no edges
-
-        Returns
-        -------
-        H : [n, embed_dim]  node embeddings
+        Per non-empty relation r (0 exc-fwd, 1 exc-bwd, 2 inh-fwd, 3 inh-bwd): (r, src, dst, coef) with
+        coef = |weight| / (#messages dst receives in that relation), i.e. a
+        |w|-weighted mean. Also returns the concatenated dst of non-empty relations.
         """
-        x = self._preprocess(x)
-        edge_index, edge_type = self._edge_types(edge_index, edge_attr, x.device)
+        if edge_index.numel() == 0:
+            return [], edge_index.new_zeros(0)
+        w = edge_attr[:, 0].float()
+        exc = w > 0
+        src, dst, mag = edge_index[0], edge_index[1], w.abs()
+        rels = []
+        for k, m in enumerate((exc, ~exc)):
+            s, d, a = src[m], dst[m], mag[m]
+            if s.numel() == 0:
+                continue
+            for j, (rs, rd) in enumerate(((s, d), (d, s))):   # forward: tail → head ; backward: head → tail
+                cnt = torch.zeros(n).index_add_(0, rd, torch.ones_like(a))
+                rels.append((2 * k + j, rs, rd, a / cnt[rd]))
+        return rels, torch.cat([rd for _, _, rd, _ in rels])
 
-        h = self.input_proj(x)
+    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor | None) -> Tensor:
+        h = self.embed_nodes(x)
+        rels, dst_all = self.relations(edge_index, edge_attr, h.size(0))
         for layer in self.layers:
-            h = layer(h, edge_index, edge_type)
+            h = layer(h, rels, dst_all)
         return h
-
-    @staticmethod
-    def graph_embedding(h: Tensor) -> Tensor:
-        """SUM pooling: [n, d] → [d]."""
-        return h.sum(dim=0)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _preprocess(x: Tensor) -> Tensor:
-        """Normalise potentially-infinite leak values."""
-        x = x.clone().float()
-        # Column 1 = leak; map inf → 0 via 1/(1+leak)
-        x[:, 1] = 1.0 / (1.0 + x[:, 1].clamp(max=1e6))
-        return x
-
-    @staticmethod
-    def _edge_types(
-        edge_index: Tensor,
-        edge_attr: Tensor | None,
-        device: torch.device,
-    ) -> tuple[Tensor, Tensor]:
-        """Return (edge_index, edge_type) where type 0=excitatory, 1=inhibitory."""
-        if edge_index.numel() == 0 or edge_attr is None:
-            ei = torch.zeros(2, 0, dtype=torch.long, device=device)
-            et = torch.zeros(0, dtype=torch.long, device=device)
-        else:
-            ei = edge_index.to(device)
-            et = (edge_attr[:, 0] <= 0).long().to(device)
-        return ei, et

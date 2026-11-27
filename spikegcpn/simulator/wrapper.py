@@ -1,23 +1,28 @@
 """
-SuperNeuroMAT wrapper: imprint a PyG Data graph onto an SNN and evaluate
-it on the N-MNIST test (or validation) split.
+SuperNeuroMAT wrapper: imprint a topology graph onto an SNN and measure
+N-MNIST accuracy.
 
-Graph conventions (must be satisfied before calling these functions):
-  - data.x        : float tensor [num_nodes, 4]
-                    columns: [threshold, leak, reset_state, refractory_period]
-  - data.edge_index : long tensor [2, num_edges], COO directed format
-  - data.edge_attr  : float tensor [num_edges, 2]
-                    columns: [weight, delay]
-                    weight > 0 → excitatory, weight < 0 → inhibitory
-  - Source nodes  : indices [0, num_source)          — fixed, pre-instantiated
-  - Sink nodes    : indices [num_nodes-num_sink, num_nodes) — fixed, 10 nodes
-  - Graph must be a DAG (enforced by the environment; checked here too)
+Graph conventions (see env/snn_env.py):
+  - x[:, :4]   : [threshold, leak, reset_state, refractory_period]
+  - edge_attr  : [weight, delay]; weight sign = excitatory / inhibitory
+  - sources    : [0, S); sinks: [S, S+K); hidden: [S+K, n)
 
-Classification head: total spike count at each sink neuron over the full
-simulation window; argmax gives the predicted class.
+Speed-ups that do not change the result:
+  - Source nodes with no outgoing edge cannot influence any sink, so they are
+    not instantiated at all (typically ~2300 of 2312 sources are isolated).
+  - Input spikes are written straight into `snn.input_spikes` instead of one
+    `add_spike` call each (`add_spike` does a linear duplicate scan per call).
+
+Readout: total spike count per sink over num_bins + longest-path steps (so
+spikes from the last bins can still reach the sinks). Ties between the top
+sinks give fractional credit 1/#tied, i.e. expected accuracy under random
+tie-breaking — the old argmax always picked sink 0, so an empty graph scored
+exactly the class-0 frequency.
 """
 
 from __future__ import annotations
+
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -25,92 +30,142 @@ from torch_geometric.data import Data
 
 from superneuromat import SNN
 
-from spikegcpn.data.nmnist import NUM_SOURCE_NODES, NUM_CLASSES, iter_dataset
-from spikegcpn.env.validity import is_dag, all_sinks_reachable
-
-# Default node feature values used when data.x is None.
-_DEFAULT_THRESHOLD = 0.5
-_DEFAULT_LEAK = float("inf")
-_DEFAULT_RESET = 0.0
-_DEFAULT_REFRAC = 0
-
-
-def _validate(data: Data, num_source: int, num_sink: int) -> None:
-    """Raise ValueError if the graph violates any structural constraint."""
-    n = data.num_nodes
-    if n < num_source + num_sink:
-        raise ValueError(
-            f"Graph has {n} nodes but needs at least "
-            f"{num_source + num_sink} (source + sink)."
-        )
-    if not is_dag(data.edge_index, n):
-        raise ValueError("Graph is not a DAG.")
-    if data.edge_index.numel() > 0 and not all_sinks_reachable(
-        data.edge_index, n, num_source, num_sink
-    ):
-        raise ValueError("Not all sink nodes are reachable from source nodes.")
+from spikegcpn.data.nmnist import NUM_CLASSES, NUM_SOURCE_NODES, NMNISTSample, load_samples
+from spikegcpn.env.validity import is_dag, longest_path_length
 
 
 def imprint(
     data: Data,
     num_source: int = NUM_SOURCE_NODES,
     num_sink: int = NUM_CLASSES,
-) -> tuple[SNN, list, list]:
+) -> tuple[SNN, np.ndarray, np.ndarray, list[int], list[int]]:
     """
-    Build a fresh SuperNeuroMAT SNN from a PyG Data object.
+    Build a SuperNeuroMAT SNN from a topology graph (DAG or recurrent).
 
     Returns
     -------
-    snn         : SNN instance with neurons and synapses but no input spikes yet
-    src_neurons : list of Neuron objects for the num_source source nodes
-    sink_neurons: list of Neuron objects for the num_sink sink nodes
+    snn              : the network (no input spikes queued)
+    kept_sources     : graph indices of the sources that were instantiated
+    kept_source_ids  : SNN neuron ids for those sources (aligned with kept_sources)
+    sink_ids         : SNN neuron ids of the K sinks, in class order
+    nonsource_ids    : SNN neuron ids of every non-source node, in graph order
     """
-    _validate(data, num_source, num_sink)
+    n = data.num_nodes
+    if n < num_source + num_sink:
+        raise ValueError(f"graph has {n} nodes, needs ≥ {num_source + num_sink}")
+
+    ei = data.edge_index
+    used_src = torch.zeros(num_source, dtype=torch.bool)
+    if ei.numel() > 0:
+        tails = ei[0][ei[0] < num_source]
+        used_src[tails] = True
+    kept_sources = used_src.nonzero(as_tuple=True)[0].numpy()
+    keep = np.concatenate([kept_sources, np.arange(num_source, n)])
 
     snn = SNN()
-    n = data.num_nodes
-    x = data.x  # may be None
-
-    # --- Create neurons in node-index order -----------------------------------
-    neurons: list = []
-    for i in range(n):
-        if x is not None:
-            threshold = float(x[i, 0])
-            leak = float(x[i, 1])
-            reset_state = float(x[i, 2])
-            refractory_period = int(x[i, 3])
-        else:
-            threshold = _DEFAULT_THRESHOLD
-            leak = _DEFAULT_LEAK
-            reset_state = _DEFAULT_RESET
-            refractory_period = _DEFAULT_REFRAC
-
+    x = data.x
+    neuron_of: dict[int, int] = {}
+    for i in keep.tolist():
         neuron = snn.create_neuron(
-            threshold=threshold,
-            leak=leak,
-            reset_state=reset_state,
-            refractory_period=refractory_period,
+            threshold=float(x[i, 0]),
+            leak=float(x[i, 1]),
+            reset_state=float(x[i, 2]),
+            refractory_period=int(x[i, 3]),
         )
-        neurons.append(neuron)
+        neuron_of[i] = neuron.idx
 
-    # --- Create synapses ------------------------------------------------------
-    if data.edge_index.numel() > 0:
-        src_idx = data.edge_index[0].tolist()
-        dst_idx = data.edge_index[1].tolist()
-        edge_attr = data.edge_attr
+    if ei.numel() > 0:
+        for (s, d), (w, delay) in zip(ei.t().tolist(), data.edge_attr.tolist()):
+            snn.create_synapse(neuron_of[s], neuron_of[d], weight=float(w), delay=max(1, int(round(delay))))
 
-        for k, (s, d) in enumerate(zip(src_idx, dst_idx)):
-            if edge_attr is not None:
-                weight = float(edge_attr[k, 0])
-                delay = max(1, int(round(float(edge_attr[k, 1]))))
-            else:
-                weight = 1.0
-                delay = 1
-            snn.create_synapse(neurons[s], neurons[d], weight=weight, delay=delay)
+    kept_ids = np.array([neuron_of[i] for i in kept_sources.tolist()], dtype=np.int64)
+    sink_ids = [neuron_of[i] for i in range(num_source, num_source + num_sink)]
+    nonsource_ids = [neuron_of[i] for i in range(num_source, n)]
+    return snn, kept_sources, kept_ids, sink_ids, nonsource_ids
 
-    src_neurons = neurons[:num_source]
-    sink_neurons = neurons[n - num_sink:]
-    return snn, src_neurons, sink_neurons
+
+def _simulate_each(data, samples, num_source, num_sink, extra_ticks):
+    """Yield (sample index, ispikes array, ids) after simulating each sample."""
+    snn, kept_sources, kept_ids, sink_ids, ns_ids = imprint(data, num_source, num_sink)
+    if extra_ticks is None:
+        if not is_dag(data.edge_index, data.num_nodes):
+            raise ValueError("recurrent graph: pass a fixed extra_ticks")
+        extra_ticks = longest_path_length(data.edge_index, data.num_nodes)
+    for n, sample in enumerate(samples):
+        snn.reset()
+        train = sample.spike_train[:, kept_sources]          # (T, kept)
+        T = train.shape[0]
+        spikes = {}
+        for t in range(T):
+            cols = np.flatnonzero(train[t])
+            if cols.size:
+                spikes[t] = {"nids": kept_ids[cols].tolist(), "values": [1.0] * cols.size}
+        snn.input_spikes = spikes
+        snn.simulate(time_steps=T + extra_ticks, use="cpu")
+        yield n, snn.ispikes, sink_ids, ns_ids
+
+
+def sink_spike_counts(
+    data: Data,
+    samples: Iterable[NMNISTSample],
+    num_source: int = NUM_SOURCE_NODES,
+    num_sink: int = NUM_CLASSES,
+    extra_ticks: int | None = None,
+) -> np.ndarray:
+    """
+    [num_samples, num_sink] total sink spike counts over num_bins + extra_ticks
+    steps (extra_ticks=None: the longest path, DAGs only).
+    """
+    samples = list(samples)
+    counts = np.zeros((len(samples), num_sink), dtype=np.int64)
+    for n, isp, sink_ids, _ in _simulate_each(data, samples, num_source, num_sink, extra_ticks):
+        counts[n] = isp[:, sink_ids].sum(axis=0)
+    return counts
+
+
+def window_spike_counts(
+    data: Data,
+    samples: Iterable[NMNISTSample],
+    num_source: int,
+    num_sink: int,
+    extra_ticks: int,
+    windows: int,
+) -> np.ndarray:
+    """
+    Reservoir features: [num_samples, num_nonsource, windows] spike counts of every
+    sink + hidden neuron in `windows` equal time windows over num_bins + extra_ticks.
+    """
+    samples = list(samples)
+    M = data.num_nodes - num_source
+    out = np.zeros((len(samples), M, windows), dtype=np.int64)
+    for n, isp, _, ns_ids in _simulate_each(data, samples, num_source, num_sink, extra_ticks):
+        sp = isp[:, ns_ids]                                   # [ticks, M]
+        ticks = sp.shape[0]
+        widx = np.arange(ticks) * windows // ticks
+        for w in range(windows):
+            out[n, :, w] = sp[widx == w].sum(axis=0)
+    return out
+
+
+def tie_credit_accuracy(counts: np.ndarray, labels: np.ndarray) -> float:
+    """Mean over samples of 1/#tied if the label is among the top-count sinks, else 0."""
+    if len(labels) == 0:
+        return 0.0
+    winners = counts == counts.max(axis=1, keepdims=True)
+    credit = winners[np.arange(len(labels)), labels] / winners.sum(axis=1)
+    return float(credit.mean())
+
+
+def evaluate_samples(
+    data: Data,
+    samples: Iterable[NMNISTSample],
+    num_source: int = NUM_SOURCE_NODES,
+    num_sink: int = NUM_CLASSES,
+) -> float:
+    """Accuracy of the topology on the given samples (fractional credit on ties)."""
+    samples = list(samples)
+    counts = sink_spike_counts(data, samples, num_source, num_sink)
+    return tie_credit_accuracy(counts, np.array([s.label for s in samples], dtype=np.int64))
 
 
 def evaluate(
@@ -120,70 +175,12 @@ def evaluate(
     num_sink: int = NUM_CLASSES,
     split: str = "Test",
     num_bins: int = 100,
-    max_samples: int | None = None,
     per_class: int | None = None,
+    max_samples: int | None = None,
+    shuffle: bool = False,
+    seed: int = 0,
+    patch: int = 1,
 ) -> float:
-    """
-    Evaluate a topology graph on the N-MNIST test split.
-
-    The SNN structure is built once from `data`; for each sample the network
-    state is reset, input spike trains are fed to the source neurons, the
-    simulation runs for `num_bins` steps, and the predicted class is the
-    sink neuron with the highest total spike count.
-
-    Parameters
-    ----------
-    data          : PyG Data object describing the SNN topology
-    nmnist_root   : path to the NMNIST directory (contains Train/ Test/)
-    num_source    : number of source nodes in the graph (default: 2312)
-    num_sink      : number of sink/output nodes (default: 10)
-    split         : "Test" or "Train"
-    num_bins      : temporal resolution for spike encoding
-    max_samples   : cap on total samples regardless of class balance
-    per_class     : if set, use at most this many samples per class (balanced)
-
-    Returns
-    -------
-    accuracy : float in [0, 1]
-    """
-    snn, src_neurons, sink_neurons = imprint(data, num_source, num_sink)
-
-    # Pre-compute sink column indices in snn.ispikes (shape: time × all_neurons).
-    # We use neuron.idx rather than our node index because delay-chain synapses
-    # may insert internal hidden neurons that shift the column layout.
-    sink_ids = [n.idx for n in sink_neurons]
-
-    correct = 0
-    total = 0
-
-    for sample in iter_dataset(nmnist_root, split=split, num_bins=num_bins, max_samples=max_samples, per_class=per_class):
-        # Reset all neuron states, spike history, and queued input spikes.
-        snn.reset()
-
-        # Feed spike train to source neurons.
-        # spike_train[t, node_idx] == True means that source node fired in bin t.
-        spike_train = sample.spike_train  # (num_bins, num_source)
-        for t in range(num_bins):
-            active = np.where(spike_train[t])[0]
-            for node_idx in active:
-                snn.add_spike(
-                    time=t,
-                    neuron_id=src_neurons[node_idx],
-                    value=1.0,
-                    exist="dontadd",  # ignore duplicate spikes in same bin
-                )
-
-        snn.simulate(time_steps=num_bins)
-
-        # ispikes shape: (num_bins, total_neurons_including_delay_chains)
-        spike_counts = np.array(
-            [int(snn.ispikes[:, sid].sum()) for sid in sink_ids],
-            dtype=np.int64,
-        )
-        predicted = int(np.argmax(spike_counts))
-
-        if predicted == sample.label:
-            correct += 1
-        total += 1
-
-    return correct / total if total > 0 else 0.0
+    """Accuracy on a (cached) N-MNIST subset."""
+    samples = load_samples(nmnist_root, split, num_bins, per_class, max_samples, shuffle, seed, patch)
+    return evaluate_samples(data, samples, num_source, num_sink)

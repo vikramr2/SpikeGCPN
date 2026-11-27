@@ -1,0 +1,8 @@
+torch
+torch_geometric
+gymnasium
+numpy
+scipy
+pyyaml
+pytest
+-e ./superneuromat

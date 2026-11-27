@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterator, Optional
 
 # N-MNIST sensor dimensions and derived constants.
@@ -13,9 +14,19 @@ NUM_SOURCE_NODES = HEIGHT * WIDTH * NUM_POLARITIES  # 2312
 NUM_CLASSES = 10
 
 
+def grid_size(patch: int = 1) -> int:
+    """Patches per side when the 34×34 sensor is pooled into patch×patch blocks."""
+    return -(-WIDTH // patch)
+
+
+def num_source_nodes(patch: int = 1) -> int:
+    """Source channels for a given patch size: 2312 at patch=1, 162 at patch=4."""
+    return NUM_POLARITIES * grid_size(patch) ** 2
+
+
 @dataclass
 class NMNISTSample:
-    spike_train: np.ndarray  # (num_bins, NUM_SOURCE_NODES), dtype bool
+    spike_train: np.ndarray  # (num_bins, num_source_nodes(patch)), dtype bool
     label: int
 
 
@@ -44,29 +55,27 @@ def _read_bin(path: str):
     p = (raw[:, 2] & 0x01).astype(np.int32)
     ts_raw = ((raw[:, 3].astype(np.int64) << 8) | raw[:, 4])
 
-    # Unwrap 16-bit timestamp rollovers.
-    ts = ts_raw.copy()
-    offset = np.int64(0)
-    for i in range(1, len(ts_raw)):
-        if ts_raw[i] < ts_raw[i - 1]:
-            offset += np.int64(65536)
-        ts[i] = ts_raw[i] + offset
+    # Unwrap 16-bit timestamp rollovers: every drop adds 65 536 to all later events.
+    wraps = np.concatenate([[0], np.cumsum(np.diff(ts_raw) < 0)])
+    ts = ts_raw + wraps.astype(np.int64) * 65536
 
     return x, y, p, ts
 
 
-def load_sample(path: str, num_bins: int = 100) -> np.ndarray:
+def load_sample(path: str, num_bins: int = 100, patch: int = 1) -> np.ndarray:
     """
     Load one N-MNIST .bin file and return a binned spike train.
 
     Returns
     -------
-    spike_train : np.ndarray, shape (num_bins, NUM_SOURCE_NODES), dtype bool
-        spike_train[t, p * H*W + y*W + x] is True if that (pixel, polarity)
-        fired at least once in bin t.
+    spike_train : np.ndarray, shape (num_bins, num_source_nodes(patch)), dtype bool
+        spike_train[t, p * G*G + (y//patch)*G + x//patch] is True if any pixel of
+        that (patch, polarity) fired in bin t, with G = grid_size(patch).
+        patch=1 is the raw pixel layout.
     """
     x, y, p, ts = _read_bin(path)
-    spike_train = np.zeros((num_bins, NUM_SOURCE_NODES), dtype=bool)
+    G = grid_size(patch)
+    spike_train = np.zeros((num_bins, num_source_nodes(patch)), dtype=bool)
 
     if len(ts) == 0:
         return spike_train
@@ -76,7 +85,7 @@ def load_sample(path: str, num_bins: int = 100) -> np.ndarray:
         t_max = t_min + 1
 
     bins = ((ts - t_min) * num_bins // (t_max - t_min + 1)).clip(0, num_bins - 1).astype(np.int32)
-    node_idx = p * (HEIGHT * WIDTH) + y * WIDTH + x
+    node_idx = p * (G * G) + (y // patch) * G + (x // patch)
     spike_train[bins, node_idx] = True
 
     return spike_train
@@ -90,6 +99,7 @@ def iter_dataset(
     per_class: Optional[int] = None,
     shuffle: bool = False,
     seed: int = 0,
+    patch: int = 1,
 ) -> Iterator[NMNISTSample]:
     """
     Yield NMNISTSample objects from a local N-MNIST directory.
@@ -104,6 +114,7 @@ def iter_dataset(
                   (ensures a balanced evaluation set)
     shuffle     : shuffle files within each class before sampling
     seed        : RNG seed used when shuffle=True
+    patch       : pool pixels into patch×patch blocks (1 = raw pixels)
     """
     import random as _random
     rng = _random.Random(seed)
@@ -123,7 +134,48 @@ def iter_dataset(
             if max_samples is not None and count >= max_samples:
                 return
             yield NMNISTSample(
-                spike_train=load_sample(str(bin_file), num_bins),
+                spike_train=load_sample(str(bin_file), num_bins, patch),
                 label=label,
             )
             count += 1
+
+
+def source_positions(num_source: int = NUM_SOURCE_NODES, patch: int = 1) -> np.ndarray:
+    """
+    (num_source, 3) float array of [x, y, polarity] per source node, with x and y
+    the patch-centre coordinates scaled to [0, 1]. Matches the index layout of
+    load_sample. If num_source does not match num_source_nodes(patch) (e.g. a toy
+    env), nodes are laid out along x with y = polarity = 0.
+    """
+    if num_source != num_source_nodes(patch):
+        pos = np.zeros((num_source, 3), dtype=np.float32)
+        pos[:, 0] = np.arange(num_source) / max(1, num_source - 1)
+        return pos
+    G = grid_size(patch)
+    idx = np.arange(num_source)
+    p = idx // (G * G)
+    rem = idx % (G * G)
+    gy, gx = rem // G, rem % G
+    scale = max(1, G - 1)
+    return np.stack([gx / scale, gy / scale, p.astype(np.float64)], axis=1).astype(np.float32)
+
+
+@lru_cache(maxsize=8)
+def load_samples(
+    root: str,
+    split: str = "Test",
+    num_bins: int = 100,
+    per_class: Optional[int] = None,
+    max_samples: Optional[int] = None,
+    shuffle: bool = False,
+    seed: int = 0,
+    patch: int = 1,
+) -> tuple[NMNISTSample, ...]:
+    """
+    Memoised, fully materialised version of iter_dataset. Reward evaluation
+    reuses the same fixed subset every episode, so parsing it once matters.
+    """
+    return tuple(iter_dataset(
+        root, split=split, num_bins=num_bins, max_samples=max_samples,
+        per_class=per_class, shuffle=shuffle, seed=seed, patch=patch,
+    ))

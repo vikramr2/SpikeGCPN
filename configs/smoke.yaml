@@ -1,0 +1,49 @@
+# Tiny end-to-end run (~15 s) to check that everything wires together.
+algo: grpo
+seed: 0
+threads: 1
+
+env:
+  patch_size: 4
+  max_hidden: 6
+  max_edges: 30
+  min_edges: 5
+  weight_levels: [1.0]
+
+model:
+  embed_dim: 32
+  num_layers: 2
+  mlp_hidden: 64
+
+train:
+  group_size: 6
+  max_iters: 5
+  log_interval: 1
+  checkpoint_interval: 1000
+  out_dir: experiments/smoke
+
+grpo:
+  epochs: 1
+  minibatch_trajs: 3
+
+gflownet:
+  replay_batch: 3
+
+inner:
+  steps: 10
+  train_per_class: 10
+
+surrogate:
+  enabled: true
+  ensemble_size: 2
+  embed_dim: 16
+  warmup: 12
+  sim_per_batch: 2
+  refit_every: 4
+  refit_steps: 10
+
+simulator:
+  nmnist_root: data/NMNIST
+  num_bins: 50
+  val_per_class: 5
+  test_per_class: 5

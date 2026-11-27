@@ -1,0 +1,94 @@
+# Reservoir search: the policy shapes a recurrent spiking reservoir with macro
+# actions (NEW neuron with a receptive field / CONNECT two neurons; sign and
+# magnitude bin; neuron type). Weights stay fixed and a linear readout over every
+# neuron's windowed spike counts is fit per topology.
+algo: gflownet          # gflownet | grpo | random
+seed: 0
+threads: 1
+run_name: null
+
+env:
+  patch_size: 4          # 162 input sources
+  num_sink: 10           # output-only neurons; in reservoir mode they are tapped by the readout like any other
+  max_hidden: 50
+  max_edges: 300
+  min_edges: 0           # synapse budget is a cap; stopping early is allowed
+  allow_cycles: true     # recurrent reservoir
+  rf_radii: [0, 1, 2]    # NEW-neuron receptive fields: 1×1, 3×3 or 5×5 patch cells (× 1 or 2 polarities)
+  weight_levels: [0.25, 0.5, 1.0, 2.0]   # fixed magnitudes the policy picks from (± each)
+  hidden_presets:
+    - {threshold: 0.5, leak: .inf}   # coincidence detector
+    - {threshold: 1.0, leak: 0.0}    # integrator
+    - {threshold: 1.0, leak: 0.25}
+    - {threshold: 2.0, leak: 0.5}
+    - {threshold: 3.0, leak: 0.1}    # slow integrator
+  source_threshold: 0.5
+  source_leak: .inf
+  sink_threshold: 1.0
+  sink_leak: 0.0
+
+model:
+  embed_dim: 64
+  num_layers: 3
+  mlp_hidden: 128
+
+train:
+  group_size: 16
+  max_iters: 200
+  sim_budget: 3200       # topology evaluations
+  log_interval: 5
+  checkpoint_interval: 50
+  out_dir: experiments
+
+grpo:
+  lr: 3.0e-4
+  clip_eps: 0.2
+  epochs: 2
+  minibatch_trajs: 4
+  entropy_coeff: 0.01
+  max_grad_norm: 1.0
+
+gflownet:
+  lr: 3.0e-4
+  logz_lr: 0.1
+  max_grad_norm: 10.0
+  temperature: 1.0
+  explore_eps: 0.05
+  replay_size: 256
+  replay_batch: 8
+
+rewards:
+  efficiency_coeff: 0.0
+  beta: 100.0
+
+inner:
+  enabled: true
+  mode: reservoir
+  windows: 5             # readout features: spike counts per neuron in 5 time windows
+  readout: logistic      # logistic (L-BFGS) | ridge (closed form; λ-sensitive, barely faster here)
+  ridge_lambda: 10.0     # on standardised features
+  l2: 1.0e-3             # logistic only
+  max_iter: 200          # logistic only
+  extra_ticks: 10        # ticks simulated after the last input bin (recurrent graphs need a fixed value)
+  train_per_class: 100   # readout training subset (Train split)
+
+surrogate:
+  enabled: false         # evaluations are cheap (~0.3 s) relative to policy sampling here
+  ensemble_size: 4
+  embed_dim: 32
+  num_layers: 2
+  lr: 1.0e-3
+  warmup: 64
+  sim_per_batch: 4
+  ucb_kappa: 1.0
+  refit_every: 16
+  refit_steps: 50
+
+simulator:
+  nmnist_root: data/NMNIST
+  num_bins: 50
+  data_seed: 0
+  reward_split: Train
+  val_per_class: 50
+  test_split: Test
+  test_per_class: 50
