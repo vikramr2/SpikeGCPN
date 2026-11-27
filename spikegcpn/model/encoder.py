@@ -121,3 +121,32 @@ class GraphEncoder(nn.Module):
         for layer in self.layers:
             h = layer(h, rels, dst_all)
         return h
+
+    def encode_batch(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor, ptr: Tensor, num_source: int) -> Tensor:
+        """
+        Same result as forward() on a disjoint union of graph states (collate
+        layout: sources are local nodes [0, S) of every graph), but cheaper.
+
+        A source without synapses receives no messages, so every layer acts on it
+        node-wise and its embedding depends only on its (fixed) features. Those
+        embeddings are computed once from graph 0's S sources and gathered; only
+        the remaining nodes go through message passing. Most of the 162 sources
+        are unconnected in most states, so this roughly halves encoder work.
+        """
+        N, S = x.size(0), num_source
+        B = ptr.numel() - 1
+        local = torch.arange(N) - torch.repeat_interleave(ptr[:-1], ptr[1:] - ptr[:-1])
+        deg = torch.zeros(N, dtype=torch.long)
+        if edge_index.numel():
+            deg.index_add_(0, edge_index.reshape(-1), torch.ones(edge_index.numel(), dtype=torch.long))
+        iso_src = (local < S) & (deg == 0)
+        if B < 2 or not bool(iso_src.any()):
+            return self.forward(x, edge_index, edge_attr)
+        base = self.forward(x[ptr[0]:ptr[0] + S], edge_index.new_zeros(2, 0), None)   # [S, d]
+        keep = ~iso_src
+        remap = torch.cumsum(keep.long(), 0) - 1
+        hk = self.forward(x[keep], remap[edge_index], edge_attr)
+        h = hk.new_empty(N, hk.size(1))
+        h[keep] = hk
+        h[iso_src] = base[local[iso_src]]
+        return h

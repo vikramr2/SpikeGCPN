@@ -1,6 +1,6 @@
 """
-Pure graph helpers shared by the environment, the policy, the GFlowNet
-backward policy and the simulator wrapper.
+Pure graph helpers shared by the environment, the policy and the
+simulator wrapper.
 
 Node index layout (see snn_env.py):
     [0, S)            source neurons  (one per input channel)
@@ -8,12 +8,11 @@ Node index layout (see snn_env.py):
     [S+K, S+K+H)      hidden neurons, in creation order
 
 Every function here takes the layout sizes explicitly so it can be applied to
-any graph prefix (GRPO/TB re-evaluate stored trajectories step by step).
+any graph prefix (GRPO re-evaluates stored trajectories step by step).
 """
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 
 import torch
@@ -167,43 +166,3 @@ def second_mask(
             for a in ancestors(in_adj, a_first):
                 mask[a] = False
     return mask
-
-
-# ---------------------------------------------------------------------------
-# GFlowNet backward policy support
-# ---------------------------------------------------------------------------
-
-def num_parents(edge_index: torch.Tensor, spec, num_hidden: int) -> int:
-    """
-    Number of (parent state, action) pairs leading to this state under the
-    macro action space; used for a uniform backward policy over them,
-    P_B = 1 / num_parents(s').
-
-    Synapses with a hidden tail can only come from CONNECT; synapses with a
-    source tail only from the NEW action that created their head. Hence:
-      * every hidden-tail synapse can be the last action (removing it leaves a
-        reachable state; re-adding it is legal, also in DAG mode);
-      * the most recent hidden neuron's NEW can be the last action iff it has no
-        out-synapses and no hidden-tail in-synapses. Several (cell, radius, pol)
-        choices can clip to the same receptive field at the grid border; each
-        is a distinct action, so they are counted separately.
-    """
-    S, K, H = spec.num_source, spec.num_sink, num_hidden
-    if edge_index.numel() == 0:
-        return 0
-    hid0 = S + K
-    src, dst = edge_index[0], edge_index[1]
-    count = int((src >= hid0).sum())
-    if H > 0:
-        last = hid0 + H - 1
-        no_out = not bool((src == last).any())
-        no_conn_in = not bool(((dst == last) & (src >= hid0)).any())
-        if no_out and no_conn_in:
-            rf = tuple(sorted(src[dst == last].tolist()))
-            count += spec.rf_multiplicity(rf)
-    return count
-
-
-def log_num_parents(edge_index: torch.Tensor, spec, num_hidden: int) -> float:
-    p = num_parents(edge_index, spec, num_hidden)
-    return math.log(p) if p > 0 else 0.0

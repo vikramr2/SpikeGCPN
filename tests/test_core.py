@@ -1,6 +1,5 @@
 """
-Invariant tests for the macro-action environment, masks, GFlowNet parent
-counting, batched policy re-scoring and the simulator wrapper.
+Invariant tests for the macro-action environment, masks, batched policy re-scoring and the simulator wrapper.
 Run with:  .venv/bin/python -m pytest -q
 """
 
@@ -15,10 +14,9 @@ from torch_geometric.data import Data
 
 from spikegcpn.data.nmnist import NMNISTSample
 from spikegcpn.env.snn_env import CONNECT, NEW, NUM_POL_CHOICES, STOP_ACTION, GraphSpec, SNNEnv, prefix_graph
-from spikegcpn.env.validity import is_dag, num_parents
+from spikegcpn.env.validity import is_dag
 from spikegcpn.model.encoder import GraphEncoder
-from spikegcpn.model.policy import PolicyHead
-from spikegcpn.train.gflownet import TBConfig, TBTrainer
+from spikegcpn.model.policy import PolicyHead, collate
 from spikegcpn.train.grpo import GRPOConfig, GRPOTrainer
 from spikegcpn.train.rollout import random_action, rescore_batch, sample_trajectories
 
@@ -81,8 +79,6 @@ def test_receptive_fields():
     assert spec.rf_sources(4, 0, 2) == [4, 13]                  # both polarities
     assert len(spec.rf_sources(4, 1, 1)) == 9                   # full 3×3, ON
     assert len(spec.rf_sources(0, 1, 2)) == 8                   # corner, clipped 2×2 × 2
-    # the full-grid OFF field: centre at radius 1, or any of the 9 cells at radius 2
-    assert spec.rf_multiplicity(tuple(spec.rf_sources(4, 1, 0))) == 10
     t = spec.rf_edge_table()
     assert t.shape == (9, 3, NUM_POL_CHOICES) and int(t[4, 1, 2]) == 18
 
@@ -124,66 +120,6 @@ def test_prefix_graph_matches_intermediate_states():
 
 
 # ---------------------------------------------------------------------------
-# GFlowNet backward policy: num_parents vs. brute force through env.step
-# ---------------------------------------------------------------------------
-
-def _brute_force_parents(spec: GraphSpec, g: Data, num_hidden: int) -> int:
-    """Count (parent, action) pairs whose env.step reproduces g exactly."""
-    hid0 = spec.hidden_start
-    E = g.edge_index.shape[1]
-    count = 0
-    L = len(spec.weight_levels)
-
-    def bin_of(w):
-        b = min(range(L), key=lambda i: abs(spec.weight_levels[i] - abs(w)))
-        return b if w > 0 else b + L
-
-    def try_step(parent: Data, h: int, action: dict) -> bool:
-        env = SNNEnv(spec)
-        env.reset()
-        env._graph, env.num_hidden = parent, h
-        try:
-            child, _ = env.step(action)
-        except ValueError:
-            return False
-        return _same_graph(child, g)
-
-    # (i) the last action added one synapse between existing neurons
-    for k in range(E):
-        keep = [i for i in range(E) if i != k]
-        parent = Data(x=g.x, edge_index=g.edge_index[:, keep], edge_attr=g.edge_attr[keep])
-        u, v = int(g.edge_index[0, k]), int(g.edge_index[1, k])
-        a = dict(STOP_ACTION, a_stop=0, a_kind=CONNECT, a_first=u, a_second=v, a_edge=bin_of(float(g.edge_attr[k, 0])))
-        count += try_step(parent, num_hidden, a)
-
-    # (ii) the last action created the most recent hidden neuron (any NEW choice)
-    if num_hidden > 0:
-        last = hid0 + num_hidden - 1
-        touching = (g.edge_index[0] == last) | (g.edge_index[1] == last)
-        keep = (~touching).nonzero(as_tuple=True)[0]
-        parent = Data(x=g.x[:last], edge_index=g.edge_index[:, keep], edge_attr=g.edge_attr[keep])
-        for c in range(spec.num_cells):
-            for r in range(len(spec.rf_radii)):
-                for p in range(NUM_POL_CHOICES):
-                    for node in range(spec.num_presets):
-                        for b in range(spec.num_edge_actions):
-                            a = dict(STOP_ACTION, a_stop=0, a_kind=NEW, a_cell=c, a_radius=r, a_pol=p, a_node=node, a_edge=b)
-                            count += try_step(parent, num_hidden - 1, a)
-    return count
-
-
-@pytest.mark.parametrize("cycles", [False, True])
-@pytest.mark.parametrize("seed", range(20))
-def test_num_parents_matches_brute_force(seed, cycles):
-    spec = GraphSpec(**SMALL, allow_cycles=cycles, weight_levels=[0.5, 1.0],
-                     hidden_presets=[(0.5, float("inf")), (1.0, 0.0)])
-    rng = random.Random(seed)
-    env = random_state(spec, rng, steps=rng.randint(1, 12))
-    assert num_parents(env.graph.edge_index, spec, env.num_hidden) == \
-        _brute_force_parents(spec, env.graph, env.num_hidden)
-
-
-# ---------------------------------------------------------------------------
 # Policy / trainers
 # ---------------------------------------------------------------------------
 
@@ -203,6 +139,27 @@ def test_rescore_matches_sampling_log_probs():
     assert any(a["a_kind"] == NEW for t in trajs for a in t.actions)
     for tr, (lp, _) in zip(trajs, rescore_batch(trajs, enc, pol)):
         assert torch.allclose(lp, torch.tensor(tr.old_log_probs), atol=1e-4)
+
+
+def test_encode_batch_matches_full_encoder():
+    spec = GraphSpec(**POLICY_SPEC)
+    enc, pol = _models(spec)
+    trajs = sample_trajectories(spec, enc, pol, 3)
+    graphs = [prefix_graph(t.final, t.edge_counts[s], t.hidden_counts[s], spec)
+              for t in trajs for s in range(0, len(t) + 1, 3)]
+    x, ei, ea, ptr = collate(graphs)
+    with torch.no_grad():
+        full, fast = enc(x, ei, ea), enc.encode_batch(x, ei, ea, ptr, spec.num_source)
+    assert torch.allclose(full, fast, atol=1e-5)
+
+
+def test_rescore_subset_of_steps():
+    spec = GraphSpec(**POLICY_SPEC)
+    enc, pol = _models(spec)
+    trajs = sample_trajectories(spec, enc, pol, 3)
+    steps = [[0, len(t) - 1] for t in trajs]
+    for tr, ts, (lp, _) in zip(trajs, steps, rescore_batch(trajs, enc, pol, steps)):
+        assert torch.allclose(lp, torch.tensor([tr.old_log_probs[t] for t in ts]), atol=1e-4)
 
 
 def test_batched_sampling_produces_legal_episodes():
@@ -226,16 +183,12 @@ def test_sources_and_sinks_are_distinguishable_at_reset():
     assert torch.unique(H[S:].round(decimals=5), dim=0).shape[0] == spec.num_sink
 
 
-@pytest.mark.parametrize("algo", ["grpo", "gflownet"])
-def test_trainer_update_changes_parameters(algo):
+def test_grpo_update_changes_parameters():
     spec = GraphSpec(**POLICY_SPEC)
     enc, pol = _models(spec)
     trajs = sample_trajectories(spec, enc, pol, 4)
     before = [p.detach().clone() for p in pol.parameters()]
-    if algo == "grpo":
-        stats = GRPOTrainer(enc, pol, GRPOConfig(epochs=1, minibatch_trajs=2)).update(trajs, [0.1, 0.2, 0.3, 0.4])
-    else:
-        stats = TBTrainer(enc, pol, TBConfig(chunk_trajs=3)).update(trajs, [1.0, 2.0, 3.0, 4.0])
+    stats = GRPOTrainer(enc, pol, GRPOConfig(epochs=1, minibatch_trajs=2, step_frac=0.5)).update(trajs, [0.1, 0.2, 0.3, 0.4])
     assert np.isfinite(stats["loss"])
     assert any(not torch.equal(a, b) for a, b in zip(before, pol.parameters()))
 

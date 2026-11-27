@@ -2,7 +2,7 @@
 # actions (NEW neuron with a receptive field / CONNECT two neurons; sign and
 # magnitude bin; neuron type). Weights stay fixed and a linear readout over every
 # neuron's windowed spike counts is fit per topology.
-algo: gflownet          # gflownet | grpo | random
+algo: grpo             # grpo | random
 seed: 0
 threads: 1
 run_name: null
@@ -47,19 +47,11 @@ grpo:
   minibatch_trajs: 4
   entropy_coeff: 0.01
   max_grad_norm: 1.0
+  step_frac: 0.5         # re-score half of each trajectory's steps per minibatch (≈2× faster update)
 
-gflownet:
-  lr: 3.0e-4
-  logz_lr: 0.1
-  max_grad_norm: 10.0
-  temperature: 1.0
-  explore_eps: 0.05
-  replay_size: 256
-  replay_batch: 8
 
 rewards:
   efficiency_coeff: 0.0
-  beta: 100.0
 
 inner:
   enabled: true

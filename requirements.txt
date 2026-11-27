@@ -4,5 +4,6 @@ gymnasium
 numpy
 scipy
 pyyaml
+matplotlib
 pytest
 -e ./superneuromat

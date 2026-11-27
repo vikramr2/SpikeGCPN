@@ -12,6 +12,11 @@ and the clipped surrogate objective is applied per step:
 
     L = - mean_t min( ρ_t A_i, clip(ρ_t, 1-ε, 1+ε) A_i ) - c_H · mean_t H_t
     ρ_t = π_θ(a_t|s_t) / π_old(a_t|s_t)
+
+With step_frac < 1 each minibatch re-scores a random subset of every
+trajectory's steps. All steps of a trajectory share its advantage, so the
+mean over the subset is an unbiased estimate of the full per-step mean at a
+fraction of the cost (re-scoring dominates the update).
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ class GRPOConfig:
     entropy_coeff: float = 0.001
     max_grad_norm: float = 1.0
     adv_eps: float = 1e-6
+    step_frac: float = 1.0       # fraction of each trajectory's steps re-scored per minibatch
 
 
 class GRPOTrainer:
@@ -63,9 +69,10 @@ class GRPOTrainer:
                 mb = idx[s:s + cfg.minibatch_trajs]
                 terms, steps = [], 0
                 clipped = kl = ent_sum = 0.0
-                scored = rescore_batch([trajs[i] for i in mb], self.encoder, self.policy)
-                for i, (lp, ent) in zip(mb, scored):
-                    old = torch.tensor(trajs[i].old_log_probs)
+                steps_mb = [self._steps(len(trajs[i])) for i in mb]
+                scored = rescore_batch([trajs[i] for i in mb], self.encoder, self.policy, steps_mb)
+                for i, ts, (lp, ent) in zip(mb, steps_mb, scored):
+                    old = torch.tensor([trajs[i].old_log_probs[t] for t in ts])
                     ratio = torch.exp(lp - old)
                     a = adv[i]
                     surr = torch.min(ratio * a, ratio.clamp(1 - cfg.clip_eps, 1 + cfg.clip_eps) * a)
@@ -94,6 +101,12 @@ class GRPOTrainer:
             "entropy": tot_ent / n_mb,
             "skipped": 0,
         }
+
+    def _steps(self, T: int) -> list[int]:
+        if self.cfg.step_frac >= 1.0:
+            return list(range(T))
+        k = max(1, round(self.cfg.step_frac * T))
+        return sorted(self.rng.sample(range(T), k))
 
     def state_dict(self) -> dict:
         return {

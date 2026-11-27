@@ -18,7 +18,7 @@ disjoint union), every decision stage is evaluated for all rows at once:
 
 c = [mean(H), mean(H_non-source), E/max_edges, H/max_hidden] per graph.
 Masks are exact, so log π(a|s) is the log-probability of the real transition
-(used directly by trajectory balance). Rows where a stage is not reached
+(the PPO-style importance ratios in GRPO rely on this). Rows where a stage is not reached
 contribute log 1 = 0 and no entropy.
 """
 
@@ -182,23 +182,26 @@ class PolicyHead(nn.Module):
         used_second: list[Tensor | None] = [None] * B
         w_conn = torch.full((B,), -1)
         if bool(is_conn.any()):
+            # Sources are never legal tails or heads: score only sinks + hidden neurons.
             n_max = int(sizes.max())
+            cand = local >= S
+            g_c, l_c, H_c = gid[cand], local[cand], H[cand]
             valid = torch.zeros(B, n_max, dtype=torch.bool)
-            valid[gid, local] = True
+            valid[g_c, l_c] = True
 
             def padded(per_node: Tensor) -> Tensor:
                 out = torch.full((B, n_max), float("-inf"))
-                out[gid, local] = per_node
+                out[g_c, l_c] = per_node
                 return out
 
-            first_logits = padded(self.m_first(torch.cat([H, c[gid]], dim=1)).squeeze(-1))
+            first_logits = padded(self.m_first(torch.cat([H_c, c[g_c]], dim=1)).squeeze(-1))
             fmask = torch.zeros(B, n_max, dtype=torch.bool)
             for i, m in enumerate(masks):
                 fmask[i, : m.first.numel()] = m.first
             a_first = pick("a_first", first_logits, fmask | (~is_conn.unsqueeze(1) & valid), is_conn)
             z_first = H[ptr[:-1] + a_first]
 
-            second_logits = padded(self.m_second(torch.cat([z_first[gid], H, c[gid]], dim=1)).squeeze(-1))
+            second_logits = padded(self.m_second(torch.cat([z_first[g_c], H_c, c[g_c]], dim=1)).squeeze(-1))
             smask = valid.clone()
             for i in range(B):
                 if bool(is_conn[i]):

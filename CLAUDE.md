@@ -8,11 +8,9 @@ SpikeGCPN replaces evolutionary topology search for spiking neural networks with
 
 - **Outer loop:** a learned policy builds an SNN with macro actions (`env/snn_env.py`), in roughly 20–60 decisions rather than one per synapse:
   - **NEW** creates a hidden neuron. Its receptive field is a (2r+1)² window of patch cells around a chosen centre, covering one or both polarities, with one shared weight. Its threshold and leak come from a chosen preset.
-  - **CONNECT** adds one synapse from a hidden neuron to another hidden neuron or a sink. The policy is trained by either:
-  - GRPO-style critic-free policy gradient (`train/grpo.py`), or
-  - a GFlowNet with trajectory balance (`train/gflownet.py`).
+  - **CONNECT** adds one synapse from a hidden neuron to another hidden neuron or a sink.
 
-  `--algo random` is the random-topology baseline.
+  The policy is trained with GRPO-style critic-free policy gradient (`train/grpo.py`). `--algo random` is the random-topology baseline. A trajectory-balance GFlowNet was tried and removed: with log P_F in the hundreds per trajectory it never learned (no better than random).
 - **Inner loop:** each sampled topology is scored by validation accuracy, with the scoring set by `inner.mode`:
   - `reservoir` (`train/readout.py`, `configs/reservoir.yaml`, the current main line): the network keeps its fixed weights and may be recurrent (`env.allow_cycles`). A logistic-regression readout is fit on every hidden and sink neuron's spike counts in W time windows. A ridge readout is also available, but it is sensitive to λ and barely faster.
   - `bptt` (`train/inner.py`, `configs/default.yaml`): surrogate-gradient BPTT trains synapse magnitudes, thresholds and leaks of a DAG, and the readout is sink spike counts. This mode underperformed: about 0.35 validation accuracy for 300 random synapses, versus 0.73 with a reservoir readout.
@@ -28,21 +26,23 @@ git submodule update --init
 /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-.venv/bin/python -m pytest -q                                  # all tests (~2 s)
-.venv/bin/python -m pytest -q tests/test_core.py -k parents    # single test
-.venv/bin/python scripts/train.py --config configs/smoke.yaml --algo gflownet   # ~5 s end-to-end
-.venv/bin/python scripts/train.py --algo grpo|gflownet|random [--no-surrogate] [--no-inner] [--seed N]
+.venv/bin/python -m pytest -q                                  # all tests (~3 s; testpaths excludes the submodule's tests)
+.venv/bin/python -m pytest -q tests/test_core.py -k encode     # single test
+.venv/bin/python scripts/train.py --config configs/smoke.yaml   # ~5 s end-to-end
+.venv/bin/python scripts/train.py --algo grpo|random [--no-surrogate] [--no-inner] [--seed N]
 .venv/bin/python scripts/compare.py launch --tag NAME --seeds 0 1 [--config configs/reservoir.yaml] [--variants random:nosur grpo:nosur ...]
 .venv/bin/python scripts/compare.py report --tag NAME
+.venv/bin/python scripts/topology_evolution.py --tag NAME      # how sampled topologies changed over training → experiments/NAME/topology/
+.venv/bin/python scripts/probe_reservoirs.py --tag NAME        # hand-designed reservoir ablations + input baselines vs the searched graphs
 ```
 
-N-MNIST must already be extracted at `data/NMNIST/{Train,Test}/{0..9}/*.bin`; the dataset is gitignored. Each run writes `metrics.csv`, `summary.yaml`, `best_graph.pt` (with trained parameters) and `ckpt.pt` to `experiments/<run>/`. Keep `threads: 1`: the per-step tensors are small, and multithreading makes training about 3× slower.
+N-MNIST must already be extracted at `data/NMNIST/{Train,Test}/{0..9}/*.bin`; the dataset is gitignored. Each run writes `metrics.csv`, `summary.yaml`, `best_graph.pt` (with trained parameters), `ckpt.pt` and `samples.pt` (every sampled trajectory's actions and accuracy per iteration) to `experiments/<run>/`. Keep `threads: 1`: the per-step tensors are small, and multithreading makes training about 3× slower.
 
 ## Architecture
 
 Pipeline:
 
-`policy samples trajectory (rollout.py)` → `RewardOracle (oracle.py)` decides cache / simulator / surrogate per graph → `GRPOTrainer` or `TBTrainer` update
+`policy samples trajectory (rollout.py)` → `RewardOracle (oracle.py)` decides cache / simulator / surrogate per graph → `GRPOTrainer` update
 
 Invariants that span several files:
 
@@ -53,17 +53,14 @@ Invariants that span several files:
 - **Masks are exact, and illegal actions raise.**
   - `snn_env.masks` covers stop, continue, NEW and CONNECT. `GraphSpec.rf_edge_table()` masks receptive fields that don't fit the remaining edge budget.
   - `validity.connect_first_mask` and `second_mask` rule out duplicates, self-loops, edges into sources or out of sinks, and cycles (unless `allow_cycles` is set).
-  - Because masks are exact, `log π(a|s)` is the log-probability of the real transition, which the trajectory-balance loss requires. Don't reintroduce no-op "invalid" steps.
+  - Because masks are exact, `log π(a|s)` is the log-probability of the real transition, which GRPO's importance ratios rely on. Don't reintroduce no-op "invalid" steps.
 - **Policy evaluation is batched.** `PolicyHead.forward_batch` evaluates every decision stage for B graph states encoded as one disjoint union (`policy.collate`). Candidate sets of different sizes are padded with masked logits.
   - `rollout.sample_trajectories` advances all episodes of a group together.
   - `rollout.rescore_batch` scores every prefix state of several trajectories in one call, using the masks stored at sampling time (`Trajectory.masks` and `second_masks`).
   - A test checks that re-scored log-probs match the sampling ones, so change both paths together.
   - Batching made each iteration about 15× faster. Before it, the policy took 90% of wall-clock time.
-- **GFlowNet backward policy.** P_B is uniform over (parent, action) pairs, counted by `validity.num_parents(edge_index, spec, H)`. A synapse with a hidden tail can only come from CONNECT; synapses with a source tail come only from the NEW that created their neuron. So the parents of a state are:
-  - undo any one hidden-tail synapse, or
-  - undo the most recent neuron, if it has no out-synapses and no hidden-tail in-synapses. Count this once for every (cell, radius, polarity) choice that clips to the same receptive field (`GraphSpec.rf_multiplicity`).
-
-  `tests/test_core.py` checks this against a brute force through `env.step`. If you change action semantics, rerun that test.
+  - `GraphEncoder.encode_batch` computes the embeddings of sources with no synapses once and gathers them (they get no messages, so they're the same in every state); a test checks it equals `forward`. CONNECT tails and heads are scored only over non-source nodes.
+  - `grpo.step_frac < 1` re-scores a random subset of each trajectory's steps per minibatch (unbiased, since all steps share the trajectory's advantage); `configs/reservoir.yaml` uses 0.5.
 - **Torch simulator ↔ SuperNeuroMAT equivalence.** `simulator/torch_lif.py` reproduces SuperNeuroMAT's update rule (linear leak toward reset, strict `>` threshold, hard reset, refractory counter, delay-1 synapses). In float64 its sink spike counts are bit-identical to SuperNeuroMAT's, which `tests/test_inner.py` checks. Two consequences:
   - Rewards use the torch forward pass.
   - The final best graph is re-verified in SuperNeuroMAT (`summary.yaml`: `best_val_acc_superneuromat`).
@@ -72,7 +69,7 @@ Invariants that span several files:
 - **Reservoir mode.**
   - `LIFBatch(fixed=True)` uses the graph's weights, thresholds and leaks exactly as stored, with no softplus and no clamping. Its windowed spike counts are therefore bit-identical to `wrapper.window_spike_counts` in SuperNeuroMAT, including on recurrent graphs with integer weights where threshold ties are common. `tests/test_reservoir.py` checks this.
   - Recurrent graphs have no longest path, so every reservoir is simulated for `num_bins + inner.extra_ticks` steps.
-  - `summary.yaml` reports the input-readout baselines. A reservoir only adds value if it beats `input_readout_matched`, a readout on the same number of random input channels as the largest allowed reservoir.
+  - `summary.yaml` reports the input-readout baselines, but `input_readout_matched` uses *random* channels and is weak. `scripts/probe_reservoirs.py` adds the fair one, a readout on the most informative cells, which beat the searched reservoirs on N-MNIST Test.
   - The readout runs off-chip.
 - **Inner training is batched but independent.** `LIFBatch` trains a group of topologies as one disconnected network: messages pass along an edge list, and no edges cross graphs. Adam is elementwise and the summed loss separates per graph, so each graph ends up with the same parameters it would get if trained alone. A test checks this. Together with the fixed `inner.seed` and `simulator.data_seed`, this makes the reward a deterministic function of the topology, which the oracle's cache relies on. Do not add global gradient clipping or batch-coupled terms to the inner loss.
 - **Inner-loop parameterization.**
@@ -93,7 +90,7 @@ Invariants that span several files:
   All of these live in `GraphSpec` and the `env:` config section.
 - **Inputs are pooled into patches.** With `patch_size: 4`, each 4×4 pixel block per polarity becomes one source (162 sources). The source fires in a time bin if any pixel in its block did. `num_source` is derived from `patch_size`, and source position features come from the patch centres.
 - **SuperNeuroMAT leak semantics.** `leak` is a linear decay toward the reset state applied every step. `leak=0` gives a perfect integrator. `leak=inf` makes the neuron memoryless: its state is wiped every step.
-- **Rewards.** `rewards.shaped_reward = accuracy − efficiency_coeff·(hidden + edges)`. GRPO normalizes rewards within each group. The GFlowNet uses `log R = beta·reward`, and results are sensitive to `beta`.
+- **Rewards.** `rewards.shaped_reward = accuracy − efficiency_coeff·(hidden + edges)`. GRPO normalizes rewards within each group.
   - The Train split provides two disjoint per-class subsets: `inner.train_per_class` samples for inner training and `simulator.val_per_class` for the reward.
   - The Test split is used only to report the best graph in `summary.yaml`.
 - **The oracle and surrogate.**

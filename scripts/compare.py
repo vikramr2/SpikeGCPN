@@ -4,9 +4,8 @@ Launch and/or summarise an algorithm comparison at a matched simulator budget.
   python scripts/compare.py launch --tag cmp1 --seeds 0 1 [--config configs/default.yaml]
   python scripts/compare.py report --tag cmp1
 
-`launch` starts one single-threaded process per (algo ∈ {gflownet, grpo, random},
-surrogate on/off, seed)
-in parallel; logs go to experiments/<tag>/<run>.log.
+`launch` starts one single-threaded process per (algo ∈ {grpo, random},
+surrogate on/off, seed) in parallel; logs go to experiments/<tag>/<run>.log.
 `report` prints, per configuration: best accuracy found on the reward split at
 several simulator-call checkpoints, and the held-out Test accuracy of the best
 graph (from summary.yaml).
@@ -24,8 +23,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-VARIANTS = [("gflownet", True), ("grpo", True), ("random", True),
-            ("gflownet", False), ("grpo", False), ("random", False)]
+VARIANTS = [("grpo", True), ("random", True), ("grpo", False), ("random", False)]
 
 
 def parse_variants(spec: list[str] | None) -> list[tuple[str, bool]]:
@@ -65,7 +63,7 @@ def launch(tag: str, seeds: list[int], config: str, variants: list[tuple[str, bo
 def report(tag: str, checkpoints: list[int]) -> None:
     base = ROOT / "experiments" / tag
     groups: dict[str, list[dict]] = defaultdict(list)
-    for run in sorted(p for p in base.iterdir() if p.is_dir()):
+    for run in sorted(p for p in base.iterdir() if (p / "metrics.csv").exists()):
         rows = list(csv.DictReader(open(run / "metrics.csv"))) if (run / "metrics.csv").exists() else []
         summ = yaml.safe_load(open(run / "summary.yaml")) if (run / "summary.yaml").exists() else {}
         best_at = {}
@@ -103,7 +101,7 @@ def main() -> None:
     a.add_argument("--tag", required=True)
     a.add_argument("--seeds", type=int, nargs="+", default=[0])
     a.add_argument("--config", default="configs/default.yaml")
-    a.add_argument("--variants", nargs="+", help="e.g. random:nosur grpo:nosur gflownet:sur (default: all six)")
+    a.add_argument("--variants", nargs="+", help="e.g. random:nosur grpo:nosur grpo:sur (default: all four)")
     r = sub.add_parser("report")
     r.add_argument("--tag", required=True)
     r.add_argument("--checkpoints", type=int, nargs="+", default=[64, 128, 256, 400, 800])

@@ -3,7 +3,7 @@ SpikeGCPN training entry point.
 
 Usage
 -----
-  python scripts/train.py --algo gflownet                    # configs/default.yaml
+  python scripts/train.py --algo grpo                        # configs/default.yaml
   python scripts/train.py --algo grpo --no-surrogate
   python scripts/train.py --algo random                      # random-topology baseline
   python scripts/train.py --config configs/smoke.yaml --algo grpo
@@ -21,7 +21,6 @@ Iteration
    With `inner.enabled: false` the topology is scored as-is by sink counts.
    The surrogate model (if enabled) decides which topologies get evaluated.
 3. GRPO: group-normalised clipped policy-gradient update.
-   GFlowNet: trajectory-balance update on fresh + replayed trajectories.
 4. Log a CSV row; stop at max_iters or when sim_budget evaluations are used.
 
 The reward function (data subsets and inner-training seed) is fixed by
@@ -29,7 +28,9 @@ The reward function (data subsets and inner-training seed) is fixed by
 algorithm optimises the same objective.
 
 Outputs go to experiments/<run_name>/: metrics.csv, config.yaml, ckpt.pt,
-best_graph.pt (trained), summary.yaml (SuperNeuroMAT-verified val + Test accuracy).
+best_graph.pt (trained), summary.yaml (SuperNeuroMAT-verified val + Test accuracy),
+samples.pt (every sampled trajectory's actions + accuracy per iteration; replay
+through SNNEnv.step to rebuild the graphs, see scripts/topology_evolution.py).
 """
 
 from __future__ import annotations
@@ -48,18 +49,17 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from spikegcpn.data.nmnist import load_samples
-from spikegcpn.env.snn_env import GraphSpec, SNNEnv
+from spikegcpn.env.snn_env import STOP_ACTION, GraphSpec, SNNEnv
 from spikegcpn.env.validity import is_dag
 from spikegcpn.model.encoder import GraphEncoder
 from spikegcpn.model.policy import PolicyHead
 from spikegcpn.model.surrogate import SurrogateEnsemble
 from spikegcpn.simulator.wrapper import evaluate_samples, window_spike_counts
-from spikegcpn.train.gflownet import TBConfig, TBTrainer
 from spikegcpn.train.grpo import GRPOConfig, GRPOTrainer
 from spikegcpn.train.inner import InnerConfig, InnerTrainer, split_per_class, stack_samples
 from spikegcpn.train.oracle import RewardOracle
 from spikegcpn.train.readout import ReadoutConfig, ReservoirEvaluator, input_readout_baselines
-from spikegcpn.train.rewards import RewardConfig, log_reward, shaped_reward
+from spikegcpn.train.rewards import RewardConfig, shaped_reward
 from spikegcpn.train.rollout import sample_random_trajectory, sample_trajectories
 
 
@@ -142,13 +142,8 @@ def train(cfg: dict, resume: str | None = None) -> dict:
 
     # --- trainer ---------------------------------------------------------
     trainer = None
-    temperature, eps = 1.0, 0.0
     if algo == "grpo":
         trainer = GRPOTrainer(encoder, policy, _dc(GRPOConfig, cfg.get("grpo")), seed)
-    elif algo == "gflownet":
-        tb_cfg = _dc(TBConfig, cfg.get("gflownet"))
-        trainer = TBTrainer(encoder, policy, tb_cfg, seed)
-        temperature, eps = tb_cfg.temperature, tb_cfg.explore_eps
     elif algo != "random":
         raise ValueError(f"unknown algo {algo!r}")
     if resume and trainer is not None:
@@ -177,11 +172,13 @@ def train(cfg: dict, resume: str | None = None) -> dict:
           f"budget={sim_budget} evals  →  {out}", flush=True)
     t0 = time.time()
     it = 0
+    action_keys = list(STOP_ACTION)
+    samples_log: list[dict] = []
     for it in range(1, max_iters + 1):
         if algo == "random":
             trajs = [sample_random_trajectory(env, rng) for _ in range(group_size)]
         else:
-            trajs = sample_trajectories(spec, encoder, policy, group_size, temperature, eps)
+            trajs = sample_trajectories(spec, encoder, policy, group_size)
 
         scores = oracle.score([t.final for t in trajs], [t.key for t in trajs])
         accs = [s.accuracy for s in scores]
@@ -190,18 +187,14 @@ def train(cfg: dict, resume: str | None = None) -> dict:
         if algo == "grpo":
             stats = trainer.update(trajs, rewards)
             aux = f"kl={stats['approx_kl']:.4f} clip={stats['clip_frac']:.3f} ent={stats['entropy']:.2f}"
-        elif algo == "gflownet":
-            log_rs = [log_reward(a, t.num_hidden, t.num_edges, reward_cfg) for a, t in zip(accs, trajs)]
-            for t, lr in zip(trajs, log_rs):
-                trainer.replay.add(t, lr)
-            replayed = trainer.replay.sample(trainer.cfg.replay_batch)
-            if replayed:
-                rs = oracle.score([t.final for t in replayed], [t.key for t in replayed], allow_sim=False)
-                log_rs += [log_reward(s.accuracy, t.num_hidden, t.num_edges, reward_cfg) for s, t in zip(rs, replayed)]
-            stats = trainer.update(trajs + replayed, log_rs)
-            aux = f"logZ={stats['log_z']:.1f} logPF={stats['mean_log_pf']:.1f} gn={stats['grad_norm']:.1f}"
         else:
             stats, aux = {"loss": 0.0}, ""
+
+        samples_log.append({
+            "iter": it,
+            "acc": np.asarray(accs, dtype=np.float32),
+            "actions": [np.array([[a[k] for k in action_keys] for a in t.actions], dtype=np.int16) for t in trajs],
+        })
 
         best = oracle.best()
         row = {
@@ -229,12 +222,15 @@ def train(cfg: dict, resume: str | None = None) -> dict:
                   f"| uniq {row['unique_frac']:.2f} | loss {row['loss']:.3g} | {aux} | {row['wall_s']:.0f}s",
                   flush=True)
 
-        if trainer is not None and it % ckpt_interval == 0:
-            torch.save({"trainer": trainer.state_dict(), "iter": it}, out / "ckpt.pt")
+        if it % ckpt_interval == 0:
+            torch.save({"action_keys": action_keys, "iters": samples_log}, out / "samples.pt")
+            if trainer is not None:
+                torch.save({"trainer": trainer.state_dict(), "iter": it}, out / "ckpt.pt")
         if oracle.sim_calls >= sim_budget:
             print(f"evaluation budget reached ({oracle.sim_calls})")
             break
     f.close()
+    torch.save({"action_keys": action_keys, "iters": samples_log}, out / "samples.pt")
     if trainer is not None:
         torch.save({"trainer": trainer.state_dict(), "iter": it}, out / "ckpt.pt")
 
@@ -280,7 +276,7 @@ def train(cfg: dict, resume: str | None = None) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser(description="Train SpikeGCPN")
     p.add_argument("--config", default="configs/default.yaml")
-    p.add_argument("--algo", choices=["grpo", "gflownet", "random"], help="overrides config 'algo'")
+    p.add_argument("--algo", choices=["grpo", "random"], help="overrides config 'algo'")
     p.add_argument("--no-surrogate", action="store_true", help="evaluate every sampled topology")
     p.add_argument("--no-inner", action="store_true", help="score topologies with fixed weights (no training)")
     p.add_argument("--seed", type=int)

@@ -26,9 +26,6 @@ grpo:
   epochs: 1
   minibatch_trajs: 3
 
-gflownet:
-  replay_batch: 3
-
 inner:
   steps: 10
   train_per_class: 10

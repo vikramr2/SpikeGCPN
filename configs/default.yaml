@@ -1,6 +1,6 @@
 # SpikeGCPN default configuration. Paths are relative to the project root.
 
-algo: gflownet          # gflownet | grpo | random  (overridable with --algo)
+algo: grpo             # grpo | random  (overridable with --algo)
 seed: 0
 threads: 1              # torch threads; 1 is fastest for these small per-step graphs
 run_name: null          # default: <algo>[_nosur]_s<seed>_<timestamp>
@@ -36,7 +36,7 @@ model:
   mlp_hidden: 128
 
 train:
-  group_size: 16         # topologies sampled per update (GRPO group / GFlowNet batch)
+  group_size: 16         # topologies sampled per update (GRPO group)
   max_iters: 100
   sim_budget: 400        # stop after this many topology evaluations
   log_interval: 5
@@ -51,18 +51,9 @@ grpo:
   entropy_coeff: 0.01
   max_grad_norm: 1.0
 
-gflownet:
-  lr: 3.0e-4
-  logz_lr: 0.1
-  max_grad_norm: 10.0
-  temperature: 1.0       # sampling temperature (off-policy is fine for TB)
-  explore_eps: 0.05      # uniform mixing over legal choices at sample time
-  replay_size: 256
-  replay_batch: 8
 
 rewards:
   efficiency_coeff: 0.0      # penalty per (hidden neuron + edge); max_edges already bounds size
-  beta: 100.0                # GFlowNet: log R = beta * reward (1 accuracy point = factor e)
 
 inner:                   # surrogate-gradient training of each sampled topology
   enabled: true

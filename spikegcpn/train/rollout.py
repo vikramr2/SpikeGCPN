@@ -1,5 +1,5 @@
 """
-Batched trajectory sampling and re-scoring shared by the GRPO and GFlowNet trainers.
+Batched trajectory sampling and re-scoring used by the GRPO trainer.
 
 All trajectories of a group advance together: at every step the current
 states of the still-running episodes are encoded as one disjoint batch and
@@ -21,7 +21,6 @@ from torch import Tensor
 from torch_geometric.data import Data
 
 from spikegcpn.env.snn_env import CONNECT, NEW, NUM_POL_CHOICES, STOP_ACTION, GraphSpec, Masks, SNNEnv, prefix_graph
-from spikegcpn.env.validity import log_num_parents
 from spikegcpn.model.encoder import GraphEncoder
 from spikegcpn.model.policy import PolicyHead, collate
 
@@ -35,7 +34,6 @@ class Trajectory:
     masks: list[Masks] = field(default_factory=list)
     second_masks: list[Tensor | None] = field(default_factory=list)
     old_log_probs: list[float] = field(default_factory=list)
-    log_pb: float = 0.0               # Σ_t log P_B(s_t | s_{t+1}), uniform over (parent, action) pairs
     key: str = ""
 
     @property
@@ -76,7 +74,7 @@ def sample_trajectories(
         hs = [envs[i].num_hidden for i in active]
         ms = [envs[i].masks() for i in active]
         x, ei, ea, ptr = collate(graphs)
-        H = encoder(x, ei, ea)
+        H = encoder.encode_batch(x, ei, ea, ptr, spec.num_source)
         acts, lp, _, sms = policy.forward_batch(
             H, ptr, graphs, hs, ms,
             second_mask_fn=lambda row, u, act=active: envs[act[row]].second_mask(u),
@@ -98,7 +96,6 @@ def sample_trajectories(
                 tr.edge_counts.append(env.num_edges)
                 tr.key = graph_key(g, spec)
             else:
-                tr.log_pb -= log_num_parents(g.edge_index, spec, env.num_hidden)
                 still.append(i)
         active = still
     return trajs
@@ -108,23 +105,29 @@ def rescore_batch(
     trajs: list[Trajectory],
     encoder: GraphEncoder,
     policy: PolicyHead,
+    steps: list[list[int]] | None = None,
 ) -> list[tuple[Tensor, Tensor]]:
-    """Per trajectory: (log π_θ(a_t|s_t) [T], entropy_t [T]) under current parameters, with grad."""
+    """
+    Per trajectory: (log π_θ(a_t|s_t), entropy_t) under current parameters, with
+    grad, for the time steps in steps[i] (default: all T steps, in order).
+    """
     spec = policy.spec
+    if steps is None:
+        steps = [list(range(len(tr))) for tr in trajs]
     graphs, hs, ms, sms, acts = [], [], [], [], []
-    for tr in trajs:
-        for t, a in enumerate(tr.actions):
+    for tr, ts in zip(trajs, steps):
+        for t in ts:
             graphs.append(prefix_graph(tr.final, tr.edge_counts[t], tr.hidden_counts[t], spec))
             hs.append(tr.hidden_counts[t])
             ms.append(tr.masks[t])
             sms.append(tr.second_masks[t])
-            acts.append(a)
+            acts.append(tr.actions[t])
     x, ei, ea, ptr = collate(graphs)
-    H = encoder(x, ei, ea)
+    H = encoder.encode_batch(x, ei, ea, ptr, spec.num_source)
     _, lp, ent, _ = policy.forward_batch(H, ptr, graphs, hs, ms, actions=acts, second_masks=sms)
     out, o = [], 0
-    for tr in trajs:
-        T = len(tr.actions)
+    for ts in steps:
+        T = len(ts)
         out.append((lp[o:o + T], ent[o:o + T]))
         o += T
     return out

@@ -147,16 +147,6 @@ class GraphSpec:
             self._rf_table = t
         return self._rf_table
 
-    def rf_multiplicity(self, sources: tuple[int, ...]) -> int:
-        """How many (cell, radius, pol) choices produce exactly this receptive field."""
-        if not hasattr(self, "_rf_mult"):
-            from collections import Counter
-            self._rf_mult = Counter(
-                tuple(self.rf_sources(c, r, p))
-                for c in range(self.num_cells) for r in range(len(self.rf_radii)) for p in range(NUM_POL_CHOICES)
-            )
-        return self._rf_mult[tuple(sources)]
-
     @classmethod
     def from_config(cls, env_cfg: dict) -> "GraphSpec":
         kw = {k: v for k, v in env_cfg.items() if k in cls.__dataclass_fields__}
