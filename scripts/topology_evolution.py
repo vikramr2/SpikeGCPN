@@ -35,10 +35,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from spikegcpn.data.nmnist import NUM_CLASSES, load_samples  # noqa: E402
+from spikegcpn.data.datasets import load_splits  # noqa: E402
 from spikegcpn.env.snn_env import CONNECT, NEW, GraphSpec  # noqa: E402
 from spikegcpn.env.validity import is_dag  # noqa: E402
-from spikegcpn.train.inner import split_per_class, stack_samples  # noqa: E402
+from spikegcpn.train.inner import stack_samples  # noqa: E402
 from spikegcpn.train.readout import ReadoutConfig, fit_readout, window_counts  # noqa: E402
 
 POL_NAMES = ["OFF", "ON", "both"]
@@ -106,19 +106,15 @@ def group_similarity(sets: list[set]) -> float:
 
 
 def cell_informativeness(cfg: dict, spec: GraphSpec) -> np.ndarray:
-    """Validation accuracy of a readout on one patch cell (both polarities, all windows) alone."""
-    s, i = cfg["simulator"], cfg["inner"]
-    pool = load_samples(s.get("nmnist_root", "data/NMNIST"), s.get("reward_split", "Train"), s["num_bins"],
-                        i["train_per_class"] + s["val_per_class"], None, True, s.get("data_seed", 0), spec.patch_size)
-    tr, va = split_per_class(pool, i["train_per_class"])
+    """Validation accuracy of a readout on one cell / channel (all polarities and windows) alone."""
+    tr, va, _, C = load_splits(cfg)
     (Xtr, ytr), (Xva, yva) = stack_samples(tr), stack_samples(va)
-    rc = ReadoutConfig(windows=i.get("windows", 5), max_iter=100)
-    C = NUM_CLASSES
+    rc = ReadoutConfig(windows=cfg["inner"].get("windows", 5), max_iter=100)
     Ftr, Fva = window_counts(Xtr, rc.windows), window_counts(Xva, rc.windows)
     W, G2 = rc.windows, spec.num_cells
     out = np.zeros(G2)
     for c in range(G2):
-        cols = torch.tensor([ch * W + w for ch in (c, c + G2) for w in range(W)])
+        cols = torch.tensor([(p * G2 + c) * W + w for p in range(spec.num_polarities) for w in range(W)])
         r = fit_readout(Ftr[:, cols], ytr, C, rc)
         out[c] = float((r.predict(Fva[:, cols]) == yva).double().mean())
     return out
@@ -274,18 +270,18 @@ def plot_evolution(per_run, spec: GraphSpec, path: Path, name: str = "") -> None
 
 
 def plot_cells(per_run, info: np.ndarray, spec: GraphSpec, path: Path) -> None:
-    G = spec.grid
+    shape = (spec.grid, spec.grid) if spec.grid else (1, spec.num_cells)       # line1d: one row of channels
     n = min(len(r["bins"]) for r in per_run)
     picks = [0, n // 2, n - 1]
     fig, axs = plt.subplots(len(per_run), len(picks) + 1, figsize=(3.4 * (len(picks) + 1), 3.2 * len(per_run)),
                             squeeze=False)
     for i, r in enumerate(per_run):
         for j, b in enumerate(picks):
-            use = np.array(r["bins"][b]["cell_use"]).reshape(G, G)
-            im = axs[i, j].imshow(use, cmap="viridis")
+            use = np.array(r["bins"][b]["cell_use"]).reshape(shape)
+            im = axs[i, j].imshow(use, cmap="viridis", aspect="auto")
             axs[i, j].set_title(f"{r['run']}\niters ≤ {r['bins'][b]['iter']}", fontsize=9)
             fig.colorbar(im, ax=axs[i, j], fraction=0.046)
-        im = axs[i, -1].imshow(info.reshape(G, G), cmap="magma")
+        im = axs[i, -1].imshow(info.reshape(shape), cmap="magma", aspect="auto")
         axs[i, -1].set_title("single-cell readout accuracy\n(input informativeness)", fontsize=9)
         fig.colorbar(im, ax=axs[i, -1], fraction=0.046)
     for ax in axs.ravel():

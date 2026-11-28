@@ -122,3 +122,44 @@ def test_f_score_ranks_the_informative_channel_first():
     X = torch.from_numpy(rng.random((90, 10, 5)) < 0.2)
     X[:, :, 3] = torch.arange(10).view(1, -1) < (3 * y.view(-1, 1) + 1)   # count grows with the label
     assert int(channel_f_scores(X, y, 3).argmax()) == 3
+
+
+# ---------------------------------------------------------------------------
+# 1-D input layout (SHD)
+# ---------------------------------------------------------------------------
+
+LINE = GraphSpec(input_layout="line1d", num_source=12, num_sink=3, max_hidden=5, max_edges=30, allow_cycles=True,
+                 rf_radii=[-1, 0, 2], weight_levels=[1.0])
+
+
+def test_line_layout_fields_are_channel_windows():
+    assert LINE.num_cells == 12 and LINE.num_pol_choices == 1 and LINE.num_polarities == 1
+    assert LINE.rf_sources(5, 2, 0) == [3, 4, 5, 6, 7]
+    assert LINE.rf_sources(0, 2, 0) == [0, 1, 2]
+    assert LINE.rf_sources(5, 0, 0) == []
+    assert LINE.rf_edge_table().shape == (12, 3, 1)
+
+
+def test_line_layout_policy_samples_legal_episodes():
+    from spikegcpn.env.snn_env import SNNEnv
+    from spikegcpn.model.encoder import GraphEncoder
+    from spikegcpn.model.policy import PolicyHead
+    from spikegcpn.train.rollout import rescore_batch, sample_trajectories
+    torch.manual_seed(0)
+    enc, pol = GraphEncoder(LINE.num_sink, 16, 2), PolicyHead(LINE, 16, 32)
+    trajs = sample_trajectories(LINE, enc, pol, 4)
+    for tr, (lp, _) in zip(trajs, rescore_batch(trajs, enc, pol)):
+        env = SNNEnv(LINE)
+        env.reset()
+        for a in tr.actions:
+            env.step(a)
+        assert torch.allclose(lp, torch.tensor(tr.old_log_probs), atol=1e-4)
+
+
+def test_shd_binning_is_or_within_channel_groups():
+    from spikegcpn.data.shd import bin_sample
+    times = np.array([0.001, 0.004, 0.012, 0.5, 2.0])
+    units = np.array([0, 4, 5, 699, 3])
+    X = bin_sample(times, units, num_bins=100, pool=5, bin_ms=10.0)
+    assert X.shape == (100, 140) and X.sum() == 3          # first two merge; t = 2 s is truncated
+    assert X[0, 0] and X[1, 1] and X[50, 139]

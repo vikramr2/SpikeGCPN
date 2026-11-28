@@ -72,7 +72,14 @@ NUM_POL_CHOICES = 3   # OFF, ON, both
 @dataclass
 class GraphSpec:
     """Everything that defines the search space. Shared by env, policy and rewards."""
-    num_source: int | None = None    # default: num_source_nodes(patch_size); must be 2·G·G
+    # grid2d: N-MNIST, sources = polarity × G×G patch grid (S = 2·G·G); receptive fields are
+    #         square windows of cells, one or both polarities.
+    # line1d: sources = line_groups × C channels on a line (group-major), e.g. SHD's
+    #         frequency axis (1 group) or CartPole's x and θ population codes (2 groups);
+    #         receptive fields are windows of 2r+1 adjacent channels in one group or both.
+    input_layout: str = "grid2d"
+    line_groups: int = 1
+    num_source: int | None = None    # default (grid2d): num_source_nodes(patch_size); must be 2·G·G
     num_sink: int = NUM_CLASSES
     patch_size: int = 1              # N-MNIST pixels pooled per source (1 = raw pixels)
     max_hidden: int = 50
@@ -101,17 +108,47 @@ class GraphSpec:
     sink_leak: float = 0.0
 
     def __post_init__(self) -> None:
+        self._rf_table: torch.Tensor | None = None
+        if self.input_layout == "line1d":
+            if self.num_source is None:
+                raise ValueError("input_layout line1d needs num_source (number of input channels)")
+            if self.line_groups not in (1, 2) or self.num_source % self.line_groups:
+                raise ValueError("line1d supports 1 or 2 groups that divide num_source")
+            self.grid = None
+            self.num_polarities = self.line_groups
+            return
+        if self.input_layout != "grid2d":
+            raise ValueError(f"unknown input_layout {self.input_layout!r}")
         if self.num_source is None:
             self.num_source = num_source_nodes(self.patch_size)
         g = math.isqrt(self.num_source // 2)
         if 2 * g * g != self.num_source:
             raise ValueError(f"num_source={self.num_source} must be 2·G·G (polarity × square patch grid)")
         self.grid = g
-        self._rf_table: torch.Tensor | None = None
+        self.num_polarities = 2
 
     @property
     def num_cells(self) -> int:
-        return self.grid * self.grid
+        """Receptive-field centres: patch cells (grid2d) or channels (line1d)."""
+        return self.num_source // self.num_polarities if self.grid is None else self.grid * self.grid
+
+    @property
+    def num_pol_choices(self) -> int:
+        """NEW polarity / group options: first, second or both (2 groups), or the only one (1 group)."""
+        return NUM_POL_CHOICES if self.num_polarities == 2 else 1
+
+    def source_positions(self):
+        """[S, 3] float32 (x, y, polarity) in [0, 1], the encoder's position features."""
+        if self.grid is None:
+            import numpy as np
+            C = self.num_cells
+            idx = np.arange(self.num_source)
+            pos = np.zeros((self.num_source, 3), dtype=np.float32)
+            pos[:, 0] = (idx % C) / max(1, C - 1)
+            pos[:, 1] = 0.5
+            pos[:, 2] = idx // C
+            return pos
+        return source_positions(self.num_source, self.patch_size)
 
     @property
     def num_edge_actions(self) -> int:
@@ -132,9 +169,15 @@ class GraphSpec:
 
     def rf_sources(self, cell: int, radius_idx: int, pol: int) -> list[int]:
         """Sorted source indices of the receptive field."""
-        G, r = self.grid, self.rf_radii[radius_idx]
+        r = self.rf_radii[radius_idx]
         if r < 0:
             return []
+        if self.grid is None:
+            C = self.num_cells
+            window = range(max(0, cell - r), min(C, cell + r + 1))
+            groups = [0] if self.num_polarities == 1 else ([pol] if pol < 2 else [0, 1])
+            return sorted(g * C + c for g in groups for c in window)
+        G = self.grid
         cy, cx = divmod(cell, G)
         cells = [y * G + x for y in range(max(0, cy - r), min(G, cy + r + 1))
                  for x in range(max(0, cx - r), min(G, cx + r + 1))]
@@ -144,10 +187,10 @@ class GraphSpec:
     def rf_edge_table(self) -> torch.Tensor:
         """[cells, radii, 3] number of synapses each NEW choice would add."""
         if self._rf_table is None:
-            t = torch.zeros(self.num_cells, len(self.rf_radii), NUM_POL_CHOICES, dtype=torch.long)
+            t = torch.zeros(self.num_cells, len(self.rf_radii), self.num_pol_choices, dtype=torch.long)
             for c in range(self.num_cells):
                 for r in range(len(self.rf_radii)):
-                    for p in range(NUM_POL_CHOICES):
+                    for p in range(self.num_pol_choices):
                         t[c, r, p] = len(self.rf_sources(c, r, p))
             self._rf_table = t
         return self._rf_table
@@ -204,7 +247,7 @@ def initial_graph(spec: GraphSpec) -> Data:
     x[:S, THR] = spec.source_threshold
     x[:S, LEAK] = spec.source_leak
     x[:S, TYPE] = SOURCE
-    x[:S, PX:POL + 1] = torch.from_numpy(source_positions(S, spec.patch_size))
+    x[:S, PX:POL + 1] = torch.from_numpy(spec.source_positions())
 
     x[S:, THR] = spec.sink_threshold
     x[S:, LEAK] = spec.sink_leak

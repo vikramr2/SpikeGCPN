@@ -5,5 +5,6 @@ numpy
 scipy
 pyyaml
 matplotlib
+h5py
 pytest
 -e ./superneuromat

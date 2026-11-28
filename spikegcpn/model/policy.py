@@ -33,7 +33,7 @@ from torch import Tensor
 from torch.distributions import Categorical
 from torch_geometric.data import Data
 
-from spikegcpn.env.snn_env import CONNECT, NEW, NUM_POL_CHOICES, SOURCE, STOP_ACTION, TYPE, GraphSpec, Masks
+from spikegcpn.env.snn_env import CONNECT, NEW, SOURCE, STOP_ACTION, TYPE, GraphSpec, Masks
 
 
 def _mlp(in_dim: int, hidden: int, out_dim: int) -> nn.Sequential:
@@ -71,7 +71,7 @@ class PolicyHead(nn.Module):
         self.m_kind = _mlp(c, mlp_hidden, 2)
         self.m_cell = _mlp(d + c, mlp_hidden, 1)
         self.m_radius = _mlp(d + c, mlp_hidden, R)
-        self.m_pol = _mlp(d + c + R, mlp_hidden, NUM_POL_CHOICES)
+        self.m_pol = _mlp(d + c + R, mlp_hidden, spec.num_pol_choices)
         self.m_node = _mlp(d + c, mlp_hidden, spec.num_presets)
         self.m_wnew = _mlp(d + c, mlp_hidden, L2)
         self.m_first = _mlp(d + c, mlp_hidden, 1)
@@ -160,7 +160,7 @@ class PolicyHead(nn.Module):
         # --- NEW: receptive field, preset, weight ---------------------------
         if bool(is_new.any()):
             src_idx = ptr[:-1].unsqueeze(1) + torch.arange(S)
-            cell_emb = H[src_idx].view(B, 2, G2, -1).mean(1)                      # [B, G2, d]
+            cell_emb = H[src_idx].view(B, spec.num_polarities, G2, -1).mean(1)                      # [B, G2, d]
             cc = c.unsqueeze(1).expand(-1, G2, -1)
             cell_logits = self.m_cell(torch.cat([cell_emb, cc], dim=2)).squeeze(-1)
             a_cell = pick("a_cell", cell_logits, torch.ones(B, G2, dtype=torch.bool), is_new)

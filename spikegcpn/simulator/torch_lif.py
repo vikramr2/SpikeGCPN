@@ -181,33 +181,17 @@ class LIFBatch(nn.Module):
         xs = x[:, :, self.kept_src].to(torch.float64)
         w = self.weights()
         thr, leak = self.neuron_params()
-        reset = self.reset
         has_refrac = bool((self.refrac > 0).any())
 
-        v = reset.expand(B, -1).clone()
-        s_ns = torch.zeros(B, self.total_ns, dtype=torch.float64)
-        s_src = torch.zeros(B, self.total_src, dtype=torch.float64)
-        refr = torch.zeros(B, self.total_ns, dtype=torch.long)
+        v, s_ns, s_src, refr = self._zero_state(B)
         counts = torch.zeros(B, G * K, dtype=torch.float64)
         stop_at = (T + self.extra).repeat_interleave(K)                # [G*K]
         total_ticks = T + int(self.extra.max())
         win = torch.zeros(B, self.total_ns, windows, dtype=torch.float64) if windows else None
 
         for t in range(total_ticks):
-            d = v - reset
-            v = reset + torch.sign(d) * F.relu(d.abs() - leak)
-            if self.tails.numel():
-                s_all = torch.cat([s_src, s_ns], dim=1)
-                msg = s_all[:, self.tails] * w
-                v = v + torch.zeros_like(v).index_add(1, self.heads, msg)
-            s = SpikeFn.apply(v - thr, self.slope)
-            if has_refrac:
-                in_ref = refr > 0
-                s = s * (~in_ref)
-                refr = torch.where(in_ref, refr - 1, refr)
-                refr = torch.where(s > 0, self.refrac.expand(B, -1), refr)
+            v, s, refr = self._tick(v, s_src, s_ns, refr, w, thr, leak, has_refrac)
             sd = s.detach()
-            v = v * (1.0 - sd) + reset * sd
             counts = counts + s[:, self.sink_pos] * (t < stop_at)
             if windows:
                 win[:, :, t * windows // total_ticks] += sd
@@ -216,6 +200,57 @@ class LIFBatch(nn.Module):
         if windows:
             return counts.view(B, G, K), win
         return counts.view(B, G, K)
+
+    def _zero_state(self, B: int):
+        return (self.reset.expand(B, -1).clone(),
+                torch.zeros(B, self.total_ns, dtype=torch.float64),
+                torch.zeros(B, self.total_src, dtype=torch.float64),
+                torch.zeros(B, self.total_ns, dtype=torch.long))
+
+    def _tick(self, v, s_src, s_ns, refr, w, thr, leak, has_refrac):
+        """One SuperNeuroMAT tick: leak, delay-1 synaptic input, spike, refractory, reset."""
+        reset = self.reset
+        d = v - reset
+        v = reset + torch.sign(d) * F.relu(d.abs() - leak)
+        if self.tails.numel():
+            s_all = torch.cat([s_src, s_ns], dim=1)
+            msg = s_all[:, self.tails] * w
+            v = v + torch.zeros_like(v).index_add(1, self.heads, msg)
+        s = SpikeFn.apply(v - thr, self.slope)
+        if has_refrac:
+            in_ref = refr > 0
+            s = s * (~in_ref)
+            refr = torch.where(in_ref, refr - 1, refr)
+            refr = torch.where(s > 0, self.refrac.expand(v.shape[0], -1), refr)
+        sd = s.detach()
+        v = v * (1.0 - sd) + reset * sd
+        return v, s, refr
+
+    # --- stepwise (closed-loop) simulation ---------------------------------
+    def init_state(self, B: int) -> dict:
+        """State for `step`: B parallel copies (e.g. episodes) of every graph, all at rest."""
+        if not hasattr(self, "src_graph"):
+            self.src_graph = torch.repeat_interleave(torch.arange(self.num_graphs), torch.tensor(self._src_counts))
+        v, s_ns, s_src, refr = self._zero_state(B)
+        return {"v": v, "s_ns": s_ns, "s_src": s_src, "refr": refr}
+
+    @torch.no_grad()
+    def step(self, state: dict, x: Tensor) -> Tensor:
+        """
+        Advance one tick in place. x: source spikes emitted this tick, either
+        [B, S] (same input for every graph) or [B, G, S] (per graph, e.g. each
+        graph controlling its own environment); like forward(), they reach their
+        targets on the next tick. Returns this tick's spikes [B, total_ns].
+        Stepping x[:, t] for t = 0 … T−1 reproduces forward(x) exactly.
+        """
+        w = self.weights()
+        thr, leak = self.neuron_params()
+        has_refrac = bool((self.refrac > 0).any())
+        v, s, refr = self._tick(state["v"], state["s_src"], state["s_ns"], state["refr"], w, thr, leak, has_refrac)
+        state["v"], state["s_ns"], state["refr"] = v, s, refr
+        x = x.to(torch.float64)
+        state["s_src"] = x[:, self.kept_src] if x.dim() == 2 else x[:, self.src_graph, self.kept_src]
+        return s
 
     def loss(self, counts: Tensor, labels: Tensor) -> Tensor:
         """Sum over graphs of the batch-mean cross-entropy on scaled sink counts."""

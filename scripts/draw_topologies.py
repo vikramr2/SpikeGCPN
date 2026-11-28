@@ -46,15 +46,28 @@ from matplotlib.animation import FuncAnimation, PillowWriter  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import FancyArrowPatch, Rectangle  # noqa: E402
 
-from spikegcpn.data.nmnist import NUM_CLASSES, load_samples  # noqa: E402
+from spikegcpn.data.datasets import load_splits  # noqa: E402
 from spikegcpn.env.snn_env import CONNECT, NEW, GraphSpec, SNNEnv  # noqa: E402
 from spikegcpn.simulator.torch_lif import LIFBatch  # noqa: E402
-from spikegcpn.train.inner import split_per_class, stack_samples  # noqa: E402
+from spikegcpn.train.inner import stack_samples  # noqa: E402
 
 POL_COLOR = ["#1f77b4", "#ff7f0e", "#9467bd"]          # OFF, ON, both
 POL_NAME = ["OFF", "ON", "both"]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X"]
 DIGIT = plt.get_cmap("tab10")
+NUM_CLASSES = 10             # set from the run's dataset in main()
+CANVAS = 9                   # drawing extent: the 9×9 grid, or a line of channels scaled to 9 wide
+
+
+def canvas_size(spec: GraphSpec) -> int:
+    return spec.grid if spec.grid else CANVAS
+
+
+def bg_image(spec: GraphSpec, per_cell: np.ndarray) -> np.ndarray:
+    """Background image from a per-cell value: the grid itself, or vertical bands over the channel axis."""
+    if spec.grid:
+        return per_cell.reshape(spec.grid, spec.grid)
+    return np.tile(per_cell.reshape(1, -1), (8, 1))
 
 
 def replay(actions: np.ndarray, keys: list[str], spec: GraphSpec):
@@ -93,30 +106,59 @@ def class_responses(graphs, spec: GraphSpec, X: torch.Tensor, y: torch.Tensor, e
     return out
 
 
-def place(spec: GraphSpec, neurons) -> tuple[dict, float]:
+def place(spec: GraphSpec, neurons) -> tuple[dict, dict, float]:
     """
-    Node positions: a neuron with a receptive field sits at its field's centre
-    (spread on a small ring when several share a cell); latent neurons (no
-    field) fill columns right of the grid. Returns (pos, x of the sink column).
+    Node positions and receptive-field boxes. grid2d: a neuron sits at its
+    field's centre cell (spread on a small ring when several share a cell).
+    line1d: x is the field's centre channel, and neurons are packed into rows so
+    their channel windows don't overlap. Latent neurons (no field) fill columns
+    right of the canvas. Returns (pos, boxes, x of the sink column).
     """
-    G = spec.grid
-    pos, per_cell, latent = {}, {}, []
+    Gc = canvas_size(spec)
+    pos, boxes, per_cell, latent, fields = {}, {}, {}, [], []
     for j, a in enumerate(neurons):
         if spec.rf_radii[a["a_radius"]] < 0:
             latent.append(j)
-        else:
+        elif spec.grid:
             per_cell.setdefault(a["a_cell"], []).append(j)
+        else:
+            fields.append(j)
+    G = spec.grid
     for cell, js in per_cell.items():
         cy, cx = divmod(cell, G)
+        r = spec.rf_radii[neurons[js[0]]["a_radius"]]
         for q, j in enumerate(js):
             ang, rad = 2 * np.pi * q / len(js), 0.0 if len(js) == 1 else 0.28
             pos[j] = (cx + rad * np.cos(ang), cy + rad * np.sin(ang))
-    per_col = 2 * G
+            r = spec.rf_radii[neurons[j]["a_radius"]]
+            boxes[j] = (max(-0.5, cx - r - 0.5), min(G - 0.5, cx + r + 0.5),
+                        max(-0.5, cy - r - 0.5), min(G - 0.5, cy + r + 0.5))
+    if fields:                                           # line1d: greedy interval packing into rows
+        sc = Gc / spec.num_source
+        ext = {}
+        for j in fields:
+            c, r = neurons[j]["a_cell"], spec.rf_radii[neurons[j]["a_radius"]]
+            ext[j] = (max(0, c - r) * sc - 0.5, min(spec.num_source, c + r + 1) * sc - 0.5, (c + 0.5) * sc - 0.5)
+        rows, row_of = [], {}
+        for j in sorted(fields, key=lambda j: ext[j][0]):
+            x0 = ext[j][0]
+            k = next((k for k, right in enumerate(rows) if right + 0.25 <= x0), None)
+            if k is None:
+                rows.append(0.0)
+                k = len(rows) - 1
+            rows[k] = max(ext[j][1], ext[j][2] + 0.15)
+            row_of[j] = k
+        h = min(0.75, (Gc - 0.4) / max(1, len(rows)))
+        for j in fields:
+            y = -0.3 + row_of[j] * h
+            pos[j] = (ext[j][2], y)
+            boxes[j] = (ext[j][0], ext[j][1], y - 0.35 * h, y + 0.35 * h)
+    per_col = 2 * Gc
     cols = -(-len(latent) // per_col)
     for q, j in enumerate(latent):
         col, row = divmod(q, per_col)
-        pos[j] = (G + 0.4 + 0.7 * col, -0.3 + row * (G - 0.4) / max(1, per_col - 1))
-    return pos, G + 0.4 + 0.7 * cols + 0.6
+        pos[j] = (Gc + 0.4 + 0.7 * col, -0.3 + row * (Gc - 0.4) / max(1, per_col - 1))
+    return pos, boxes, Gc + 0.4 + 0.7 * cols + 0.6
 
 
 def _neuron_marker(ax, x, y, rv, marker, size):
@@ -129,20 +171,18 @@ def _neuron_marker(ax, x, y, rv, marker, size):
 
 
 def draw(ax, spec: GraphSpec, neurons, conns, resp: np.ndarray, background: np.ndarray, title: str) -> None:
-    G, L, h0, S, K = spec.grid, len(spec.weight_levels), spec.hidden_start, spec.num_source, spec.num_sink
-    ax.imshow(background, cmap="Greys", origin="upper", extent=(-0.5, G - 0.5, G - 0.5, -0.5), alpha=0.55)
-    pos, sink_x = place(spec, neurons)
+    G, L, h0, S, K = canvas_size(spec), len(spec.weight_levels), spec.hidden_start, spec.num_source, spec.num_sink
+    ax.imshow(background, cmap="Greys", origin="upper", extent=(-0.5, G - 0.5, G - 0.5, -0.5), alpha=0.55,
+              aspect="auto")
+    pos, boxes, sink_x = place(spec, neurons)
     sink_y = np.linspace(-0.3, G - 0.7, K)
     if any(spec.rf_radii[a["a_radius"]] < 0 for a in neurons):
         ax.text(G + 0.4, G - 0.05, "latent", fontsize=7, ha="left", color="0.3")
 
-    for a in neurons:
-        r = spec.rf_radii[a["a_radius"]]
-        if r < 0:
+    for j, a in enumerate(neurons):
+        if j not in boxes:
             continue
-        cy, cx = divmod(a["a_cell"], G)
-        x0, x1 = max(-0.5, cx - r - 0.5), min(G - 0.5, cx + r + 0.5)
-        y0, y1 = max(-0.5, cy - r - 0.5), min(G - 0.5, cy + r + 0.5)
+        x0, x1, y0, y1 = boxes[j]
         inh = a["a_edge"] >= L
         ax.add_patch(Rectangle((x0 + 0.04, y0 + 0.04), x1 - x0 - 0.08, y1 - y0 - 0.08, fill=False,
                                ec=POL_COLOR[a["a_pol"]], lw=0.8, ls="--" if inh else "-", alpha=0.55, zorder=2))
@@ -172,7 +212,8 @@ def draw(ax, spec: GraphSpec, neurons, conns, resp: np.ndarray, background: np.n
 
 
 def legend(fig, spec: GraphSpec) -> None:
-    h = [Line2D([], [], color=c, lw=1.5, label=f"field: {n}") for c, n in zip(POL_COLOR, POL_NAME)]
+    h = [Line2D([], [], color=c, lw=1.5, label=f"field: {n}")
+         for c, n in list(zip(POL_COLOR, POL_NAME))[:spec.num_pol_choices]]
     h += [Line2D([], [], color="0.3", lw=1.2, ls="--", label="inhibitory field")]
     h += [Line2D([], [], ls="", marker=MARKERS[i], mfc="0.7", mec="k", label=f"thr {t:g}, leak {lk:g}")
           for i, (t, lk) in enumerate(spec.hidden_presets)]
@@ -180,7 +221,7 @@ def legend(fig, spec: GraphSpec) -> None:
           Line2D([], [], ls="", marker="o", mfc="none", mec="0.5", label="silent neuron"),
           Line2D([], [], color="#2ca02c", lw=1.2, label="CONNECT exc."),
           Line2D([], [], color="#d62728", lw=1.2, label="CONNECT inh.")]
-    h += [Line2D([], [], ls="", marker="o", mfc=DIGIT(c), mec="k", label=f"prefers {c}") for c in range(10)]
+    h += [Line2D([], [], ls="", marker="o", mfc=DIGIT(c), mec="k", label=f"prefers {c}") for c in range(NUM_CLASSES)]
     fig.legend(handles=h, loc="lower center", ncol=8, fontsize=7, frameon=False)
 
 
@@ -191,22 +232,22 @@ def main() -> None:
     ap.add_argument("--snapshots", type=int, nargs="+", default=[1, 25, 50, 100, 150, 200])
     args = ap.parse_args()
     torch.set_num_threads(1)
+    global NUM_CLASSES, DIGIT
 
     base = Path("experiments") / args.tag
     runs = sorted(p for p in base.iterdir() if (p / "samples.pt").exists())
     cfg = yaml.safe_load(open(runs[0] / "config.yaml"))
     spec = GraphSpec.from_config(cfg["env"])
-    s, i = cfg["simulator"], cfg["inner"]
-    pool = load_samples(s.get("nmnist_root", "data/NMNIST"), "Train", s["num_bins"],
-                        i["train_per_class"] + s["val_per_class"], None, True, s.get("data_seed", 0), spec.patch_size)
-    _, va = split_per_class(pool, i["train_per_class"])
+    i = cfg["inner"]
+    _, va, _, NUM_CLASSES = load_splits(cfg)
+    DIGIT = plt.get_cmap("tab10" if NUM_CLASSES <= 10 else "tab20")
     Xva, yva = stack_samples(va)
     extra = int(i.get("extra_ticks", 10))
     G2 = spec.num_cells
     ev = Xva.float().sum(1)                                   # [N, S] events per source
-    cell_ev = ev[:, :G2] + ev[:, G2:]                          # both polarities
-    background = cell_ev.mean(0).reshape(spec.grid, spec.grid).numpy()
-    digit_bg = [cell_ev[yva == c].mean(0).reshape(spec.grid, spec.grid).numpy() for c in range(NUM_CLASSES)]
+    cell_ev = ev.view(len(ev), spec.num_polarities, G2).sum(1)  # summed over polarities
+    background = bg_image(spec, cell_ev.mean(0).numpy())
+    digit_bg = [bg_image(spec, cell_ev[yva == c].mean(0).numpy()) for c in range(NUM_CLASSES)]
     out = base / "topology"
     out.mkdir(exist_ok=True)
 
@@ -247,7 +288,7 @@ def main() -> None:
         for ax in axs.ravel()[len(snaps):]:
             ax.axis("off")
         fig.suptitle(f"{run.name}: best sampled reservoir at each iteration "
-                     "(background = mean input events per patch cell)", fontsize=12)
+                     "(background = mean input events per " + ("patch cell" if spec.grid else "channel") + ")", fontsize=12)
         legend(fig, spec)
         fig.tight_layout(rect=(0, 0.07, 1, 0.97))
         fig.savefig(out / f"graphs_{run.name}.png", dpi=130)
@@ -274,19 +315,20 @@ def main() -> None:
         best_acc = float(iters[bi]["acc"][bj])
         g, neurons, conns = replay(iters[bi]["actions"][bj], keys, spec)
         (resp,) = class_responses([g], spec, Xva, yva, extra)
-        K, G = spec.num_sink, spec.grid
+        K, G = spec.num_sink, canvas_size(spec)
         z = (resp - resp.mean(1, keepdims=True)) / (resp.std(1, keepdims=True) + 1e-9)
-        pos, _ = place(spec, neurons)
-        fig, axs = plt.subplots(2, 5, figsize=(17, 7.6))
+        pos, _, _ = place(spec, neurons)
+        nrow = -(-NUM_CLASSES // 5)
+        fig, axs = plt.subplots(nrow, 5, figsize=(17, 3.8 * nrow))
         sc = None
         for c, ax in enumerate(axs.ravel()):
-            ax.imshow(digit_bg[c], cmap="Greys", origin="upper", extent=(-0.5, G - 0.5, G - 0.5, -0.5))
+            ax.imshow(digit_bg[c], cmap="Greys", origin="upper", extent=(-0.5, G - 0.5, G - 0.5, -0.5), aspect="auto")
             for j, a in enumerate(neurons):
                 if spec.rf_radii[a["a_radius"]] < 0:
                     continue
                 sc = ax.scatter(*pos[j], s=55, marker=MARKERS[a["a_node"] % len(MARKERS)], c=[z[K + j, c]],
                                 cmap="coolwarm", vmin=-2.5, vmax=2.5, edgecolor="k", lw=0.4)
-            ax.set_title(f"digit {c}", fontsize=10)
+            ax.set_title(f"class {c}", fontsize=10)
             ax.set_xticks([])
             ax.set_yticks([])
         if sc is not None:

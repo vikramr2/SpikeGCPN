@@ -20,7 +20,7 @@ import torch
 from torch import Tensor
 from torch_geometric.data import Data
 
-from spikegcpn.env.snn_env import CONNECT, NEW, NUM_POL_CHOICES, STOP_ACTION, GraphSpec, Masks, SNNEnv, prefix_graph
+from spikegcpn.env.snn_env import CONNECT, NEW, STOP_ACTION, GraphSpec, Masks, SNNEnv, prefix_graph
 from spikegcpn.model.encoder import GraphEncoder
 from spikegcpn.model.policy import PolicyHead, collate
 
@@ -150,7 +150,7 @@ def random_action(env: SNNEnv, rng, p_stop: float = 0.0) -> dict:
         a["a_cell"] = rng.randrange(spec.num_cells)
         fits = table[a["a_cell"]] <= m.remaining
         a["a_radius"] = rng.choice([r for r in range(len(spec.rf_radii)) if bool(fits[r].any())])
-        a["a_pol"] = rng.choice([p for p in range(NUM_POL_CHOICES) if bool(fits[a["a_radius"], p])])
+        a["a_pol"] = rng.choice([p for p in range(spec.num_pol_choices) if bool(fits[a["a_radius"], p])])
         a["a_node"] = rng.randrange(spec.num_presets)
     else:
         a["a_first"] = rng.choice(m.first.nonzero(as_tuple=True)[0].tolist())

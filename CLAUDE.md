@@ -15,6 +15,7 @@ SpikeGCPN replaces evolutionary topology search for spiking neural networks with
   - `reservoir` (`train/readout.py`): the network keeps its fixed weights and may be recurrent (`env.allow_cycles`). A logistic-regression readout is fit on spike counts in W time windows. A ridge readout is also available, but it is sensitive to λ and barely faster. `inner.readout_neurons` picks what the readout sees:
     - `all` (`configs/reservoir.yaml`): every hidden and sink neuron. Hidden neurons with receptive fields can relay the input straight to the readout, and on N-MNIST the search converged to exactly that.
     - `outputs` (`configs/latent.yaml`, the current main line): only the sinks, which then act as `num_sink` output neurons independent of the 10 classes. Sinks have no input of their own, so everything the readout gets has flowed through the searched graph. `rf_radii` includes -1, which makes NEW create a latent neuron with no receptive field, driven only by CONNECT. Ablations: `env.allow_cycles=false` (depth without recurrence) and `env.hidden_to_hidden=false` (receptive-field neurons → outputs only).
+  - `control` (`control/evaluator.py`, `configs/cartpole.yaml`): CartPole with the velocities hidden. The masked observation (x, θ) is population-coded onto the sources, the reservoir runs stepwise with state carried across env steps (`LIFBatch.step`), a logistic readout is behaviour-cloned from a full-state expert on precomputed DART-noise rollouts, and the reward is the closed-loop return / 500 over fixed-seed episodes. A memoryless readout on the code scores ~42 and one step of input memory scores ~500, so the reward measures whether the reservoir supplies memory. `control/cartpole.py` is a vectorised copy of gymnasium's dynamics (tested step for step).
   - `bptt` (`train/inner.py`, `configs/default.yaml`): surrogate-gradient BPTT trains synapse magnitudes, thresholds and leaks of a DAG, and the readout is sink spike counts. This mode underperformed: about 0.35 validation accuracy for 300 random synapses, versus 0.73 with a reservoir readout.
 
 An optional GNN-ensemble surrogate (`model/surrogate.py`) decides which topologies are worth an inner-loop evaluation. SuperNeuroMAT (ORNL, a git submodule) is the reference simulator. `idea.md` is the original design doc and still describes GCPN+PPO with fixed weights, both since replaced.
@@ -40,7 +41,7 @@ git submodule update --init
 .venv/bin/python scripts/draw_topologies.py --tag NAME         # the sampled graphs drawn over the patch grid through training, + digit tuning
 ```
 
-N-MNIST must already be extracted at `data/NMNIST/{Train,Test}/{0..9}/*.bin`; the dataset is gitignored. Each run writes `metrics.csv`, `summary.yaml`, `best_graph.pt` (with trained parameters), `ckpt.pt` and `samples.pt` (every sampled trajectory's actions and accuracy per iteration) to `experiments/<run>/`. Keep `threads: 1`: the per-step tensors are small, and multithreading makes training about 3× slower.
+N-MNIST must already be extracted at `data/NMNIST/{Train,Test}/{0..9}/*.bin`, and SHD at `data/SHD/shd_{train,test}.h5` (from https://zenkelab.org/datasets/); `data/` is gitignored. `simulator.dataset` (nmnist | shd) selects the data, and `data/datasets.load_splits(cfg)` is the one loader shared by training and the analysis scripts. Each run writes `metrics.csv`, `summary.yaml`, `best_graph.pt` (with trained parameters), `ckpt.pt` and `samples.pt` (every sampled trajectory's actions and accuracy per iteration) to `experiments/<run>/`. Keep `threads: 1`: the per-step tensors are small, and multithreading makes training about 3× slower.
 
 ## Architecture
 
@@ -51,7 +52,7 @@ Pipeline:
 Invariants that span several files:
 
 - **Node layout is fixed and append-only.** Sources occupy `[0, S)`, sinks `[S, S+K)`, and hidden neurons `[S+K, …)` in creation order.
-  - Sources are polarity-major over a G×G patch grid, so `S = 2·G·G` (`GraphSpec` enforces this).
+  - `env.input_layout` sets how sources are arranged. `grid2d` (N-MNIST): polarity-major over a G×G patch grid, so `S = 2·G·G`. `line1d`: `line_groups` × C channels on a line, group-major: SHD's 140 pooled frequency channels (1 group), or CartPole's x and θ population codes (2 groups). Receptive fields are windows of 2r+1 adjacent channels; `GraphSpec.num_cells`, `num_polarities` and `num_pol_choices` abstract over the layouts.
   - Nodes and edges are only ever appended, so the state before action `t` is a prefix of the final graph. `Trajectory` stores the hidden and edge counts at each step, and `prefix_graph` rebuilds any state from them.
   - `simulator/wrapper.py`, `validity.py`, the encoder and `PolicyHead`'s cell pooling all rely on this layout.
 - **Masks are exact, and illegal actions raise.**
@@ -64,6 +65,7 @@ Invariants that span several files:
   - A test checks that re-scored log-probs match the sampling ones, so change both paths together.
   - Batching made each iteration about 15× faster. Before it, the policy took 90% of wall-clock time.
   - `GraphEncoder.encode_batch` computes the embeddings of sources with no synapses once and gathers them (they get no messages, so they're the same in every state); a test checks it equals `forward`. CONNECT tails and heads are scored only over non-source nodes.
+  - `LIFBatch.step(state, x)` advances one tick with per-graph inputs `[B, G, S]` (each graph drives its own environment). Stepping reproduces `forward` exactly (tested), and both share `_tick`, so change the dynamics in one place.
   - `grpo.step_frac < 1` re-scores a random subset of each trajectory's steps per minibatch (unbiased, since all steps share the trajectory's advantage); `configs/reservoir.yaml` uses 0.5.
 - **Torch simulator ↔ SuperNeuroMAT equivalence.** `simulator/torch_lif.py` reproduces SuperNeuroMAT's update rule (linear leak toward reset, strict `>` threshold, hard reset, refractory counter, delay-1 synapses). In float64 its sink spike counts are bit-identical to SuperNeuroMAT's, which `tests/test_inner.py` checks. Two consequences:
   - Rewards use the torch forward pass.

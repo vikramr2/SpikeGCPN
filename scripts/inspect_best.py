@@ -20,10 +20,10 @@ from torch_geometric.data import Data
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from spikegcpn.data.nmnist import NUM_CLASSES, load_samples  # noqa: E402
+from spikegcpn.data.datasets import load_splits  # noqa: E402
 from spikegcpn.env.snn_env import GraphSpec  # noqa: E402
 from spikegcpn.env.validity import is_dag  # noqa: E402
-from spikegcpn.train.inner import split_per_class, stack_samples  # noqa: E402
+from spikegcpn.train.inner import stack_samples  # noqa: E402
 from spikegcpn.train.readout import ReadoutConfig, ReservoirEvaluator  # noqa: E402
 
 
@@ -57,12 +57,7 @@ def main() -> None:
     torch.set_num_threads(1)
     runs = sorted(p.parent for p in (Path("experiments") / args.tag).glob("*/best_graph.pt"))
     cfg = yaml.safe_load(open(runs[0] / "config.yaml"))
-    s, i = cfg["simulator"], cfg["inner"]
-    patch = cfg["env"].get("patch_size", 4)
-    pool = load_samples(s["nmnist_root"], "Train", s["num_bins"], i["train_per_class"] + s["val_per_class"],
-                        None, True, s.get("data_seed", 0), patch)
-    tr, va = split_per_class(pool, i["train_per_class"])
-    te = load_samples(s["nmnist_root"], "Test", s["num_bins"], args.test_per_class, None, True, s.get("data_seed", 0), patch)
+    tr, va, te, NUM_CLASSES = load_splits(cfg, test_per_class=args.test_per_class)
     sets = {"val": stack_samples(va), "test": stack_samples(te)}
     rows = {}
     for run in runs:

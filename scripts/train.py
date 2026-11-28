@@ -18,6 +18,9 @@ Iteration
                  on every neuron's windowed spike counts → validation accuracy
      bptt      : train weights / thresholds / leaks with surrogate-gradient
                  BPTT, read out sink spike counts → validation accuracy
+     control   : CartPole with hidden velocities; behaviour-clone a readout from
+                 the reservoir's read-out neurons, then run it closed loop →
+                 mean return / 500 (spikegcpn/control/evaluator.py)
    With `inner.enabled: false` the topology is scored as-is by sink counts.
    The surrogate model (if enabled) decides which topologies get evaluated.
 3. GRPO: group-normalised clipped policy-gradient update.
@@ -48,7 +51,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from spikegcpn.data.nmnist import NUM_CLASSES, load_samples
+from spikegcpn.control.evaluator import ControlConfig, ControlEvaluator
+from spikegcpn.data.datasets import load_splits, num_sources
 from spikegcpn.env.snn_env import STOP_ACTION, GraphSpec, SNNEnv
 from spikegcpn.env.validity import is_dag
 from spikegcpn.model.encoder import GraphEncoder
@@ -56,7 +60,7 @@ from spikegcpn.model.policy import PolicyHead
 from spikegcpn.model.surrogate import SurrogateEnsemble
 from spikegcpn.simulator.wrapper import evaluate_samples, window_spike_counts
 from spikegcpn.train.grpo import GRPOConfig, GRPOTrainer
-from spikegcpn.train.inner import InnerConfig, InnerTrainer, split_per_class, stack_samples
+from spikegcpn.train.inner import InnerConfig, InnerTrainer, stack_samples
 from spikegcpn.train.oracle import RewardOracle
 from spikegcpn.train.readout import ReadoutConfig, ReservoirEvaluator, input_readout_baselines
 from spikegcpn.train.rewards import RewardConfig, shaped_reward
@@ -78,7 +82,6 @@ def train(cfg: dict, resume: str | None = None) -> dict:
 
     algo = cfg["algo"]
     tcfg = cfg.get("train", {})
-    scfg = cfg.get("simulator", {})
     sur_cfg = cfg.get("surrogate", {})
     icfg = cfg.get("inner", {})
     mcfg = cfg.get("model", {})
@@ -90,23 +93,26 @@ def train(cfg: dict, resume: str | None = None) -> dict:
     policy = PolicyHead(spec, mcfg.get("embed_dim", 64), mcfg.get("mlp_hidden", 128))
 
     # --- reward pipeline (fixed across runs) -----------------------------
-    root, bins, patch = scfg.get("nmnist_root", "data/NMNIST"), scfg.get("num_bins", 50), spec.patch_size
-    dseed = scfg.get("data_seed", 0)
-    n_train, n_val = icfg.get("train_per_class", 100), scfg.get("val_per_class", 50)
-    pool = load_samples(root, scfg.get("reward_split", "Train"), bins, n_train + n_val, None, True, dseed, patch)
-    train_samples, val_samples = split_per_class(pool, n_train)
-    test_samples = load_samples(root, scfg.get("test_split", "Test"), bins,
-                                scfg.get("test_per_class", 50), None, True, dseed, patch)
-
     use_inner = icfg.get("enabled", True)
     mode = icfg.get("mode", "bptt") if use_inner else "none"
-    if spec.allow_cycles and mode != "reservoir":
-        raise ValueError("recurrent topologies (allow_cycles) are only supported with inner.mode: reservoir")
-    if mode != "reservoir" and spec.num_sink != NUM_CLASSES:
-        raise ValueError(f"num_sink != {NUM_CLASSES} needs inner.mode: reservoir (sinks are then read-out neurons)")
-    inner = reservoir = None
+    if mode != "control":
+        if spec.num_source != num_sources(cfg):
+            raise ValueError(f"env has {spec.num_source} sources but the data has {num_sources(cfg)} input channels")
+        train_samples, val_samples, test_samples, NUM_CLASSES = load_splits(cfg)
+        if mode != "reservoir" and spec.num_sink != NUM_CLASSES:
+            raise ValueError(f"num_sink != {NUM_CLASSES} needs inner.mode: reservoir (sinks are then read-out neurons)")
+    if spec.allow_cycles and mode not in ("reservoir", "control"):
+        raise ValueError("recurrent topologies (allow_cycles) need inner.mode: reservoir or control")
+    inner = reservoir = controller = None
     baselines: dict = {}
-    if mode == "bptt":
+    if mode == "control":
+        controller = ControlEvaluator(spec.num_source, spec.num_sink, _dc(ControlConfig, icfg))
+        baselines = controller.baselines()
+        print("control baselines:", baselines, flush=True)
+
+        def simulate(graphs):
+            return controller.train_and_eval(graphs)[0]
+    elif mode == "bptt":
         inner = InnerTrainer(spec.num_source, spec.num_sink, stack_samples(train_samples),
                              stack_samples(val_samples), _dc(InnerConfig, icfg))
 
@@ -247,7 +253,12 @@ def train(cfg: dict, resume: str | None = None) -> dict:
         summary.update(best_val_acc=round(best[1], 4), best_edges=int(g.edge_index.shape[1]),
                        best_hidden=int(g.num_nodes - spec.hidden_start),
                        best_recurrent=bool(spec.allow_cycles and not is_dag(g.edge_index, g.num_nodes)))
-        if reservoir is not None:
+        if controller is not None:
+            # Refit the behaviour-cloned readout (deterministic), test on held-out episodes,
+            # and check that SuperNeuroMAT reproduces the closed-loop read-out spikes exactly.
+            _, (ro,) = controller.train_and_eval([g])
+            summary.update(best_test_return=round(controller.test(g, ro), 2), **controller.verify_superneuromat(g, ro))
+        elif reservoir is not None:
             # Refit the readout (deterministic), then recompute the reservoir features in
             # SuperNeuroMAT itself and apply the readout → val / Test accuracy.
             _, (ro,) = reservoir.train_and_eval([g])
