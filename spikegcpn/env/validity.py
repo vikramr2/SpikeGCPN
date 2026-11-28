@@ -120,11 +120,12 @@ def connect_first_mask(
     num_sink: int,
     num_hidden: int,
     allow_cycles: bool = False,
+    hidden_to_hidden: bool = True,
 ) -> torch.Tensor:
     """
     bool [n]: hidden neurons that have at least one legal CONNECT head, i.e. a
-    sink or another hidden neuron that is not already a target (and, in DAG
-    mode, not an ancestor).
+    sink or (if hidden_to_hidden) another hidden neuron that is not already a
+    target (and, in DAG mode, not an ancestor).
     """
     S, K, H = num_source, num_sink, num_hidden
     n = S + K + H
@@ -134,6 +135,9 @@ def connect_first_mask(
         return mask
     out_adj, in_adj = _adjacency(edge_index, n)
     for u in range(hid0, n):
+        if not hidden_to_hidden:
+            mask[u] = K - len(out_adj[u]) > 0
+            continue
         hidden_anc = 0 if allow_cycles else sum(1 for a in ancestors(in_adj, u) if a >= hid0)
         legal = K + (H - 1 - hidden_anc) - len(out_adj[u])
         mask[u] = legal > 0
@@ -147,16 +151,19 @@ def second_mask(
     num_hidden: int,
     a_first: int,
     allow_cycles: bool = False,
+    hidden_to_hidden: bool = True,
 ) -> torch.Tensor:
     """
     bool [n]: True where a_first → v is a legal CONNECT synapse (v is not a
-    source, not a_first, not already targeted, and — in DAG mode — not an
-    ancestor of a_first).
+    source, not a_first, not already targeted, a sink if not hidden_to_hidden,
+    and — in DAG mode — not an ancestor of a_first).
     """
     S, K, H = num_source, num_sink, num_hidden
     n = S + K + H
     mask = torch.ones(n, dtype=torch.bool)
     mask[:S] = False
+    if not hidden_to_hidden:
+        mask[S + K:] = False
     mask[a_first] = False
     if edge_index.numel() > 0:
         out_adj, in_adj = _adjacency(edge_index, n)

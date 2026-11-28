@@ -12,7 +12,9 @@ SpikeGCPN replaces evolutionary topology search for spiking neural networks with
 
   The policy is trained with GRPO-style critic-free policy gradient (`train/grpo.py`). `--algo random` is the random-topology baseline. A trajectory-balance GFlowNet was tried and removed: with log P_F in the hundreds per trajectory it never learned (no better than random).
 - **Inner loop:** each sampled topology is scored by validation accuracy, with the scoring set by `inner.mode`:
-  - `reservoir` (`train/readout.py`, `configs/reservoir.yaml`, the current main line): the network keeps its fixed weights and may be recurrent (`env.allow_cycles`). A logistic-regression readout is fit on every hidden and sink neuron's spike counts in W time windows. A ridge readout is also available, but it is sensitive to λ and barely faster.
+  - `reservoir` (`train/readout.py`): the network keeps its fixed weights and may be recurrent (`env.allow_cycles`). A logistic-regression readout is fit on spike counts in W time windows. A ridge readout is also available, but it is sensitive to λ and barely faster. `inner.readout_neurons` picks what the readout sees:
+    - `all` (`configs/reservoir.yaml`): every hidden and sink neuron. Hidden neurons with receptive fields can relay the input straight to the readout, and on N-MNIST the search converged to exactly that.
+    - `outputs` (`configs/latent.yaml`, the current main line): only the sinks, which then act as `num_sink` output neurons independent of the 10 classes. Sinks have no input of their own, so everything the readout gets has flowed through the searched graph. `rf_radii` includes -1, which makes NEW create a latent neuron with no receptive field, driven only by CONNECT. Ablations: `env.allow_cycles=false` (depth without recurrence) and `env.hidden_to_hidden=false` (receptive-field neurons → outputs only).
   - `bptt` (`train/inner.py`, `configs/default.yaml`): surrogate-gradient BPTT trains synapse magnitudes, thresholds and leaks of a DAG, and the readout is sink spike counts. This mode underperformed: about 0.35 validation accuracy for 300 random synapses, versus 0.73 with a reservoir readout.
 
 An optional GNN-ensemble surrogate (`model/surrogate.py`) decides which topologies are worth an inner-loop evaluation. SuperNeuroMAT (ORNL, a git submodule) is the reference simulator. `idea.md` is the original design doc and still describes GCPN+PPO with fixed weights, both since replaced.
@@ -31,9 +33,11 @@ git submodule update --init
 .venv/bin/python scripts/train.py --config configs/smoke.yaml   # ~5 s end-to-end
 .venv/bin/python scripts/train.py --algo grpo|random [--no-surrogate] [--no-inner] [--seed N]
 .venv/bin/python scripts/compare.py launch --tag NAME --seeds 0 1 [--config configs/reservoir.yaml] [--variants random:nosur grpo:nosur ...]
+.venv/bin/python scripts/compare.py launch --tag NAME --seeds 0 1 --config configs/latent.yaml --variants grpo:nosur --suffix dag --set env.allow_cycles=false   # variant under the same tag
 .venv/bin/python scripts/compare.py report --tag NAME
 .venv/bin/python scripts/topology_evolution.py --tag NAME      # how sampled topologies changed over training → experiments/NAME/topology/
-.venv/bin/python scripts/probe_reservoirs.py --tag NAME        # hand-designed reservoir ablations + input baselines vs the searched graphs
+.venv/bin/python scripts/probe_reservoirs.py --tag NAME        # hand-designed reservoir ablations + input baselines (readout_neurons: all only)
+.venv/bin/python scripts/draw_topologies.py --tag NAME         # the sampled graphs drawn over the patch grid through training, + digit tuning
 ```
 
 N-MNIST must already be extracted at `data/NMNIST/{Train,Test}/{0..9}/*.bin`; the dataset is gitignored. Each run writes `metrics.csv`, `summary.yaml`, `best_graph.pt` (with trained parameters), `ckpt.pt` and `samples.pt` (every sampled trajectory's actions and accuracy per iteration) to `experiments/<run>/`. Keep `threads: 1`: the per-step tensors are small, and multithreading makes training about 3× slower.
@@ -69,7 +73,7 @@ Invariants that span several files:
 - **Reservoir mode.**
   - `LIFBatch(fixed=True)` uses the graph's weights, thresholds and leaks exactly as stored, with no softplus and no clamping. Its windowed spike counts are therefore bit-identical to `wrapper.window_spike_counts` in SuperNeuroMAT, including on recurrent graphs with integer weights where threshold ties are common. `tests/test_reservoir.py` checks this.
   - Recurrent graphs have no longest path, so every reservoir is simulated for `num_bins + inner.extra_ticks` steps.
-  - `summary.yaml` reports the input-readout baselines, but `input_readout_matched` uses *random* channels and is weak. `scripts/probe_reservoirs.py` adds the fair one, a readout on the most informative cells, which beat the searched reservoirs on N-MNIST Test.
+  - `summary.yaml` reports input-readout baselines with as many channels as the readout has neurons: `input_readout_matched` uses random channels and is weak; `input_readout_top` uses the channels with the highest ANOVA F-statistic on the training split, and is the fair one to beat. With `readout_neurons: all`, a readout on the most informative cells beat the searched reservoirs on N-MNIST Test (`scripts/probe_reservoirs.py`).
   - The readout runs off-chip.
 - **Inner training is batched but independent.** `LIFBatch` trains a group of topologies as one disconnected network: messages pass along an edge list, and no edges cross graphs. Adam is elementwise and the summed loss separates per graph, so each graph ends up with the same parameters it would get if trained alone. A test checks this. Together with the fixed `inner.seed` and `simulator.data_seed`, this makes the reward a deterministic function of the topology, which the oracle's cache relies on. Do not add global gradient clipping or batch-coupled terms to the inner loss.
 - **Inner-loop parameterization.**
@@ -82,6 +86,7 @@ Invariants that span several files:
   - gives sources Fourier features of their pixel position and sinks a per-class embedding.
 
   Without these, all 2312 sources had identical embeddings and `a_first` was uniform over pixels.
+- **`num_sink` vs classes.** In BPTT mode sinks are the class neurons, so `num_sink` must be 10. In reservoir mode they are just read-out neurons; class counts come from `data.nmnist.NUM_CLASSES`, so `ReservoirEvaluator` and the baselines take `num_classes` separately.
 - **Action fields.**
   - `a_edge` is a signed weight bin (`weight_levels` × ±). With BPTT, set `weight_levels: [1.0]`, so the policy picks only the sign.
   - `a_node` picks a `hidden_presets` entry, which sets the neuron's initial (threshold, leak).

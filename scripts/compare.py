@@ -37,19 +37,22 @@ def parse_variants(spec: list[str] | None) -> list[tuple[str, bool]]:
     return out
 
 
-def launch(tag: str, seeds: list[int], config: str, variants: list[tuple[str, bool]]) -> None:
+def launch(tag: str, seeds: list[int], config: str, variants: list[tuple[str, bool]],
+           overrides: list[str] | None = None, suffix: str = "") -> None:
     out = ROOT / "experiments" / tag
     out.mkdir(parents=True, exist_ok=True)
     cfg = yaml.safe_load(open(ROOT / config))
     cfg.setdefault("train", {})["out_dir"] = str(out)
     cfg_path = out / "base_config.yaml"
-    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    if not cfg_path.exists():          # several launches (variants) may share one tag
+        cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     procs = []
     for algo, sur in variants:
         for seed in seeds:
-            name = f"{algo}_{'sur' if sur else 'nosur'}_s{seed}"
-            cmd = [sys.executable, "-W", "ignore", str(ROOT / "scripts/train.py"), "--config", str(cfg_path),
-                   "--algo", algo, "--seed", str(seed), "--run-name", name]
+            name = f"{algo}_{'sur' if sur else 'nosur'}{'_' + suffix if suffix else ''}_s{seed}"
+            cmd = [sys.executable, "-W", "ignore", str(ROOT / "scripts/train.py"), "--config", str(ROOT / config),
+                   "--algo", algo, "--seed", str(seed), "--run-name", name,
+                   "--set", f"train.out_dir={out}", *(overrides or [])]
             if not sur:
                 cmd.append("--no-surrogate")
             log = open(out / f"{name}.log", "w")
@@ -79,7 +82,7 @@ def report(tag: str, checkpoints: list[int]) -> None:
         })
 
     hdr = ["config", "run", "iters", "sims"] + [f"best@{c}" for c in checkpoints] + \
-          ["batch_acc_last", "uniq_last", "snm_val(best)", "test_acc(best)", "test_in_matched", "test_in_all", "E", "H"]
+          ["batch_acc_last", "uniq_last", "snm_val(best)", "test_acc(best)", "test_in_matched", "test_in_top", "test_in_all", "E", "H"]
     print(" | ".join(hdr))
     for cfg, runs in groups.items():
         for r in runs:
@@ -90,6 +93,7 @@ def report(tag: str, checkpoints: list[int]) -> None:
                               f"{s.get('best_val_acc_superneuromat', float('nan')):.3f}" if s else "running",
                               f"{s.get('best_test_acc', float('nan')):.3f}" if s else "running",
                               f"{s.get('test_input_readout_matched', float('nan')):.3f}" if s else "-",
+                              f"{s.get('test_input_readout_top', float('nan')):.3f}" if s else "-",
                               f"{s.get('test_input_readout_all', float('nan')):.3f}" if s else "-",
                               str(s.get("best_edges", "-")), str(s.get("best_hidden", "-"))]))
 
@@ -102,12 +106,14 @@ def main() -> None:
     a.add_argument("--seeds", type=int, nargs="+", default=[0])
     a.add_argument("--config", default="configs/default.yaml")
     a.add_argument("--variants", nargs="+", help="e.g. random:nosur grpo:nosur grpo:sur (default: all four)")
+    a.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="config overrides passed to train.py")
+    a.add_argument("--suffix", default="", help="appended to run names, to tell variants apart within a tag")
     r = sub.add_parser("report")
     r.add_argument("--tag", required=True)
     r.add_argument("--checkpoints", type=int, nargs="+", default=[64, 128, 256, 400, 800])
     args = p.parse_args()
     if args.cmd == "launch":
-        launch(args.tag, args.seeds, args.config, parse_variants(args.variants))
+        launch(args.tag, args.seeds, args.config, parse_variants(args.variants), args.set, args.suffix)
     else:
         report(args.tag, args.checkpoints)
 

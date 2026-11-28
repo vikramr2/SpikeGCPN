@@ -48,7 +48,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from spikegcpn.data.nmnist import load_samples
+from spikegcpn.data.nmnist import NUM_CLASSES, load_samples
 from spikegcpn.env.snn_env import STOP_ACTION, GraphSpec, SNNEnv
 from spikegcpn.env.validity import is_dag
 from spikegcpn.model.encoder import GraphEncoder
@@ -102,6 +102,8 @@ def train(cfg: dict, resume: str | None = None) -> dict:
     mode = icfg.get("mode", "bptt") if use_inner else "none"
     if spec.allow_cycles and mode != "reservoir":
         raise ValueError("recurrent topologies (allow_cycles) are only supported with inner.mode: reservoir")
+    if mode != "reservoir" and spec.num_sink != NUM_CLASSES:
+        raise ValueError(f"num_sink != {NUM_CLASSES} needs inner.mode: reservoir (sinks are then read-out neurons)")
     inner = reservoir = None
     baselines: dict = {}
     if mode == "bptt":
@@ -114,9 +116,9 @@ def train(cfg: dict, resume: str | None = None) -> dict:
         rcfg = _dc(ReadoutConfig, icfg)
         extra_ticks = int(icfg.get("extra_ticks", 10))
         tr_set, va_set = stack_samples(train_samples), stack_samples(val_samples)
-        reservoir = ReservoirEvaluator(spec.num_source, spec.num_sink, tr_set, va_set, rcfg, extra_ticks)
-        baselines = input_readout_baselines(tr_set, va_set, spec.num_sink, rcfg,
-                                            matched_neurons=spec.num_sink + spec.max_hidden)
+        reservoir = ReservoirEvaluator(spec.num_source, spec.num_sink, tr_set, va_set, rcfg, extra_ticks, NUM_CLASSES)
+        read_neurons = spec.num_sink if rcfg.readout_neurons == "outputs" else spec.num_sink + spec.max_hidden
+        baselines = input_readout_baselines(tr_set, va_set, NUM_CLASSES, rcfg, matched_neurons=read_neurons)
         print("input-readout baselines:", baselines, flush=True)
 
         def simulate(graphs):
@@ -252,15 +254,18 @@ def train(cfg: dict, resume: str | None = None) -> dict:
             W = reservoir.cfg.windows
             accs = {}
             for name, samples in (("val", val_samples), ("test", test_samples)):
-                feats = torch.from_numpy(window_spike_counts(
-                    g, samples, spec.num_source, spec.num_sink, reservoir.extra_ticks, W)).reshape(len(samples), -1)
+                win = window_spike_counts(g, samples, spec.num_source, spec.num_sink, reservoir.extra_ticks, W)
+                if reservoir.cfg.readout_neurons == "outputs":
+                    win = win[:, :spec.num_sink]
+                feats = torch.from_numpy(win).reshape(len(samples), -1)
                 labels = torch.tensor([smp.label for smp in samples])
                 accs[name] = float((ro.predict(feats.double()) == labels).double().mean())
             summary.update(best_val_acc_superneuromat=round(accs["val"], 4), best_test_acc=round(accs["test"], 4))
             test_in = input_readout_baselines(stack_samples(train_samples), stack_samples(test_samples),
-                                              spec.num_sink, reservoir.cfg, spec.num_sink + spec.max_hidden)
+                                              NUM_CLASSES, reservoir.cfg, read_neurons)
             summary.update(test_input_readout_all=round(test_in["input_readout_all"], 4),
-                           test_input_readout_matched=round(test_in["input_readout_matched"], 4))
+                           test_input_readout_matched=round(test_in["input_readout_matched"], 4),
+                           test_input_readout_top=round(test_in["input_readout_top"], 4))
         else:
             if inner is not None:
                 _, (g,) = inner.train_and_eval([g])   # deterministic: same parameters as during search
@@ -282,9 +287,18 @@ def main() -> None:
     p.add_argument("--seed", type=int)
     p.add_argument("--run-name")
     p.add_argument("--resume")
+    p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                   help="override config entries, e.g. env.allow_cycles=false rewards.efficiency_coeff=1e-4")
     args = p.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
+    for kv in args.set:
+        key, val = kv.split("=", 1)
+        *path, last = key.split(".")
+        d = cfg
+        for k in path:
+            d = d.setdefault(k, {})
+        d[last] = yaml.safe_load(val)
     if args.algo:
         cfg["algo"] = args.algo
     if args.no_surrogate:

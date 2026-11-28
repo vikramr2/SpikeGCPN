@@ -8,7 +8,8 @@ accuracy per iteration, written by scripts/train.py) for every run in the tag,
 computes per-graph statistics straight from the macro actions, averages them
 over bins of iterations and seeds, and writes to experiments/<tag>/topology/:
 
-  evolution.png   accuracy, composition, receptive-field size / polarity,
+  evolution.png   (evolution_<variant>.png when the tag has several variants)
+                  accuracy, composition, receptive-field size / polarity,
                   neuron presets, weights, CONNECT usage, group similarity
   cells.png       where the receptive fields are placed (early / mid / late)
                   next to how informative each input cell is on its own
@@ -34,7 +35,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from spikegcpn.data.nmnist import load_samples  # noqa: E402
+from spikegcpn.data.nmnist import NUM_CLASSES, load_samples  # noqa: E402
 from spikegcpn.env.snn_env import CONNECT, NEW, GraphSpec  # noqa: E402
 from spikegcpn.env.validity import is_dag  # noqa: E402
 from spikegcpn.train.inner import split_per_class, stack_samples  # noqa: E402
@@ -58,11 +59,16 @@ def graph_stats(acts: np.ndarray, keys: list[str], spec: GraphSpec) -> dict:
     cell_use = np.zeros(spec.num_cells)            # receptive-field mass per cell (each RF spreads 1 unit)
     for c, r, p in new[:, [k["a_cell"], k["a_radius"], k["a_pol"]]]:
         cells = sorted({s % spec.num_cells for s in spec.rf_sources(int(c), int(r), int(p))})
+        if not cells:                               # latent neuron: no receptive field
+            continue
         covered[cells] = True
         cell_use[cells] += 1.0 / len(cells)
 
     heads = conn[:, k["a_second"]]
+    tails = conn[:, k["a_first"]]
     hh = conn[heads >= h0]
+    latent = {h0 + j for j, r in enumerate(new[:, k["a_radius"]]) if spec.rf_radii[int(r)] < 0}
+    active_latent = len(latent & set(heads.tolist()) & set(tails.tolist()))
     n_hidden = len(new)
     recurrent = False
     if len(hh):
@@ -73,7 +79,7 @@ def graph_stats(acts: np.ndarray, keys: list[str], spec: GraphSpec) -> dict:
         "hidden": n_hidden,
         "rf_synapses": int(sum(rf_sizes)),
         "conn_synapses": len(conn),
-        "rf_size_mean": float(np.mean(rf_sizes)) if rf_sizes else 0.0,
+        "rf_size_mean": float(np.mean([x for x in rf_sizes if x > 0])) if any(rf_sizes) else 0.0,
         "radius": np.bincount(new[:, k["a_radius"]], minlength=len(spec.rf_radii)),
         "pol": np.bincount(new[:, k["a_pol"]], minlength=3),
         "preset": np.bincount(new[:, k["a_node"]], minlength=spec.num_presets),
@@ -84,7 +90,12 @@ def graph_stats(acts: np.ndarray, keys: list[str], spec: GraphSpec) -> dict:
         "recurrent": recurrent,
         "coverage": float(covered.mean()),
         "cell_use": cell_use,
-        "rf_set": {(int(c), int(r), int(p)) for c, r, p in new[:, [k["a_cell"], k["a_radius"], k["a_pol"]]]},
+        "latent": len(latent),
+        "latent_wired": active_latent,              # latent neurons with both an in- and an out-synapse
+        "outputs_driven": len(set(heads[(heads >= S) & (heads < S + K)].tolist())),
+        "conn_hh": len(hh),
+        "rf_set": {(int(c), int(r), int(p)) for c, r, p in new[:, [k["a_cell"], k["a_radius"], k["a_pol"]]]
+                   if spec.rf_radii[int(r)] >= 0},
     }
 
 
@@ -102,12 +113,13 @@ def cell_informativeness(cfg: dict, spec: GraphSpec) -> np.ndarray:
     tr, va = split_per_class(pool, i["train_per_class"])
     (Xtr, ytr), (Xva, yva) = stack_samples(tr), stack_samples(va)
     rc = ReadoutConfig(windows=i.get("windows", 5), max_iter=100)
+    C = NUM_CLASSES
     Ftr, Fva = window_counts(Xtr, rc.windows), window_counts(Xva, rc.windows)
     W, G2 = rc.windows, spec.num_cells
     out = np.zeros(G2)
     for c in range(G2):
         cols = torch.tensor([ch * W + w for ch in (c, c + G2) for w in range(W)])
-        r = fit_readout(Ftr[:, cols], ytr, spec.num_sink, rc)
+        r = fit_readout(Ftr[:, cols], ytr, C, rc)
         out[c] = float((r.predict(Fva[:, cols]) == yva).double().mean())
     return out
 
@@ -163,6 +175,10 @@ def main() -> None:
                 "conn_to_sink": float(np.mean([s["conn_to_sink"] for s in gs])),
                 "recurrent": float(np.mean([s["recurrent"] for s in gs])),
                 "coverage": float(np.mean([s["coverage"] for s in gs])),
+                "latent": float(np.mean([s["latent"] for s in gs])),
+                "latent_wired": float(np.mean([s["latent_wired"] for s in gs])),
+                "outputs_driven": float(np.mean([s["outputs_driven"] for s in gs])),
+                "conn_hh": float(np.mean([s["conn_hh"] for s in gs])),
                 "similarity": float(np.mean(sims)),
                 "cell_use": np.mean([s["cell_use"] for s in gs], axis=0).tolist(),
             })
@@ -170,11 +186,16 @@ def main() -> None:
         print(f"{run.name}: {len(iters)} iterations, {len(bins)} bins", flush=True)
 
     info = cell_informativeness(cfg, spec)
+    groups: dict[str, list] = {}                     # variants: run name without the seed
+    for r in per_run:
+        groups.setdefault(r["run"].rsplit("_s", 1)[0], []).append(r)
     json.dump({"runs": per_run, "cell_informativeness": info.tolist(),
                "presets": [list(p) for p in spec.hidden_presets], "rf_radii": spec.rf_radii,
                "weight_levels": spec.weight_levels}, open(out / "stats.json", "w"))
-    plot_evolution(per_run, spec, out / "evolution.png")
-    plot_cells(per_run, info, spec, out / "cells.png")
+    for name, rs in groups.items():
+        tag = "" if len(groups) == 1 else f"_{name}"
+        plot_evolution(rs, spec, out / f"evolution{tag}.png", name)
+        plot_cells(rs, info, spec, out / f"cells{tag}.png")
     print("wrote", out)
 
 
@@ -185,8 +206,9 @@ def _series(per_run, key):
     return x[:n], y
 
 
-def plot_evolution(per_run, spec: GraphSpec, path: Path) -> None:
+def plot_evolution(per_run, spec: GraphSpec, path: Path, name: str = "") -> None:
     fig, axs = plt.subplots(3, 3, figsize=(15, 12))
+    fig.suptitle(f"{name}: {len(per_run)} seeds (thin) and their mean (thick)", fontsize=12)
     axs = axs.ravel()
 
     def lines(ax, key, label=None, color=None):
@@ -212,6 +234,11 @@ def plot_evolution(per_run, spec: GraphSpec, path: Path) -> None:
     lines(axs[1], "hidden", "hidden neurons", "C0")
     lines(axs[1], "rf_synapses", "receptive-field synapses", "C2")
     lines(axs[1], "conn_synapses", "CONNECT synapses", "C3")
+    lines(axs[1], "conn_hh", "  of which hidden→hidden", "C1")
+    if any(b["latent"] > 0 for r in per_run for b in r["bins"]):
+        lines(axs[1], "latent", "latent neurons (no field)", "C4")
+        lines(axs[1], "latent_wired", "  of which wired in and out", "C6")
+    lines(axs[1], "outputs_driven", "outputs with ≥1 input", "C7")
     axs[1].set_title("composition per graph")
     axs[1].legend()
 
@@ -220,7 +247,8 @@ def plot_evolution(per_run, spec: GraphSpec, path: Path) -> None:
     axs[2].set_title("receptive fields")
     axs[2].legend()
 
-    stacked(axs[3], "radius", [f"r={r} ({2 * r + 1}×{2 * r + 1})" for r in spec.rf_radii], "receptive-field radius")
+    stacked(axs[3], "radius", ["none (latent)" if r < 0 else f"r={r} ({2 * r + 1}×{2 * r + 1})" for r in spec.rf_radii],
+            "receptive-field radius")
     stacked(axs[4], "pol", POL_NAMES, "receptive-field polarity")
     stacked(axs[5], "preset", [f"thr {t:g}, leak {lk:g}" for t, lk in spec.hidden_presets], "hidden neuron preset")
     stacked(axs[6], "new_wmag", [f"|w|={w:g}" for w in spec.weight_levels], "receptive-field weight magnitude")
@@ -240,7 +268,7 @@ def plot_evolution(per_run, spec: GraphSpec, path: Path) -> None:
     for ax in axs:
         ax.set_xlabel("iteration")
         ax.grid(alpha=0.3)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(path, dpi=110)
     plt.close(fig)
 

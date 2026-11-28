@@ -27,7 +27,7 @@ Action dict (unused fields are -1)
 a_stop   : 0/1
 a_kind   : 0 = NEW, 1 = CONNECT
 a_cell   : NEW — receptive-field centre, gy·G + gx
-a_radius : NEW — index into spec.rf_radii
+a_radius : NEW — index into spec.rf_radii (radius -1 = no receptive field, a latent neuron)
 a_pol    : NEW — 0 = OFF only, 1 = ON only, 2 = both polarities
 a_node   : NEW — hidden preset index (threshold, leak)
 a_first  : CONNECT — tail (hidden node index)
@@ -79,6 +79,9 @@ class GraphSpec:
     max_edges: int = 100
     min_edges: int = 0               # stop is masked until this many edges exist (= max_edges: fixed size)
     allow_cycles: bool = False       # recurrent connections between hidden neurons (reservoirs)
+    hidden_to_hidden: bool = True    # False: CONNECT may only target sinks (feedforward ablation)
+    # Receptive-field radii in patch cells (Chebyshev). -1 = no receptive field: the
+    # neuron is latent and only receives input through CONNECT synapses.
     rf_radii: list[int] = field(default_factory=lambda: [0, 1, 2])
     # Synapse magnitudes, each offered as +w and -w. With BPTT inner training use
     # a single level: the policy then only picks the sign and gradients set |w|.
@@ -130,6 +133,8 @@ class GraphSpec:
     def rf_sources(self, cell: int, radius_idx: int, pol: int) -> list[int]:
         """Sorted source indices of the receptive field."""
         G, r = self.grid, self.rf_radii[radius_idx]
+        if r < 0:
+            return []
         cy, cx = divmod(cell, G)
         cells = [y * G + x for y in range(max(0, cy - r), min(G, cy + r + 1))
                  for x in range(max(0, cx - r), min(G, cx + r + 1))]
@@ -172,7 +177,8 @@ def masks(graph: Data, spec: GraphSpec, num_hidden: int) -> Masks:
     E = int(graph.edge_index.shape[1])
     remaining = spec.max_edges - E
     new_ok = num_hidden < spec.max_hidden and remaining >= 1
-    first = connect_first_mask(graph.edge_index, spec.num_source, spec.num_sink, num_hidden, spec.allow_cycles)
+    first = connect_first_mask(graph.edge_index, spec.num_source, spec.num_sink, num_hidden, spec.allow_cycles,
+                               spec.hidden_to_hidden)
     conn_ok = remaining >= 1 and bool(first.any())
     cont = new_ok or conn_ok
     return Masks(
@@ -186,7 +192,8 @@ def masks(graph: Data, spec: GraphSpec, num_hidden: int) -> Masks:
 
 
 def second_mask_for(graph: Data, spec: GraphSpec, num_hidden: int, a_first: int) -> torch.Tensor:
-    return second_mask(graph.edge_index, spec.num_source, spec.num_sink, num_hidden, a_first, spec.allow_cycles)
+    return second_mask(graph.edge_index, spec.num_source, spec.num_sink, num_hidden, a_first, spec.allow_cycles,
+                       spec.hidden_to_hidden)
 
 
 def initial_graph(spec: GraphSpec) -> Data:
